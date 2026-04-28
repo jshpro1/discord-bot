@@ -4,7 +4,10 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 한국 시간대 (UTC+9)
+KST = timezone(timedelta(hours=9))
 
 load_dotenv()
 TOKEN     = os.getenv("TOKEN")
@@ -54,10 +57,6 @@ REAL_MINUTES_PER_SERVER_DAY = 48
 BASE_WATER_MINUTES          = 48
 SUMMER_WATER_MINUTES        = 24
 
-# 작물 성장일 수 기준 총 물주기 횟수 (1일=1회, 5일=5회)
-def total_water_count(crop: str) -> int:
-    return CROPS[crop]
-
 user_tasks: dict[int, asyncio.Task] = {}
 user_data:  dict[int, dict]         = {}
 
@@ -65,7 +64,7 @@ user_data:  dict[int, dict]         = {}
 # ─────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────
-def calc_growth(crop: str, season: str) -> tuple[float, int, bool]:
+def calc_growth(crop: str, season: str) -> tuple[float, int, bool, int]:
     days        = CROPS[crop]
     base_min    = days * REAL_MINUTES_PER_SERVER_DAY
     season_mult = {"봄": 0.8, "겨울": 1.5}.get(season, 1.0)
@@ -73,7 +72,10 @@ def calc_growth(crop: str, season: str) -> tuple[float, int, bool]:
     bonus       = 0.5 if in_season else 1.0
     final_min   = round(base_min * season_mult * bonus, 1)
     water_min   = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
-    return final_min, water_min, in_season
+    # 실제 물주기 횟수 = 총 성장시간 / 물주기 간격 (올림)
+    import math
+    total_waters = math.ceil(final_min / water_min)
+    return final_min, water_min, in_season, total_waters
 
 def fmt_time(dt: datetime) -> str:
     return dt.strftime("%H:%M")
@@ -128,23 +130,69 @@ async def cmd_help(interaction: discord.Interaction):
 # ─────────────────────────────────────────
 @bot.tree.command(name="작물목록", description="심을 수 있는 모든 작물을 보여줍니다", guilds=GUILDS)
 async def cmd_croplist(interaction: discord.Interaction):
-    embed  = discord.Embed(title="🌾 작물 목록 (서버 기준 성장일)", color=0xFEE75C)
-    groups: dict[int, list[str]] = {}
-    for crop, days in CROPS.items():
-        groups.setdefault(days, []).append(crop)
-    for days in sorted(groups):
-        lines = []
-        for c in groups[days]:
-            csem = season_emoji(CROP_SEASON.get(c, ""))
-            cs   = CROP_SEASON.get(c, "?")
-            lines.append(f"`{c}` {csem}{cs}")
-        embed.add_field(
-            name=f"📅 {days}일 (물주기 {days}회)",
-            value="  ".join(lines),
-            inline=False
+    await interaction.response.defer()
+
+    DAY_ICON = {1: "⚡", 2: "🌿", 3: "🌳", 4: "🏔️", 5: "💎"}
+    SEASON_COLOR = {"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}
+    SEASON_DESC  = {
+        "봄":  "🌸 봄 작물 — 성장속도 **×0.8배** (가장 빠름!)",
+        "여름": "☀️ 여름 작물 — 물주기 주기 **24분** (절반!)",
+        "가을": "🍂 가을 작물 — **2.5% 확률** 수확량 2배!",
+        "겨울": "❄️ 겨울 작물 — 성장속도 **×1.5배** (느림)",
+    }
+
+    embeds = []
+    for season in ["봄", "여름", "가을", "겨울"]:
+        import math
+        crops_sorted = sorted(SEASON_CROPS[season], key=lambda c: CROPS[c])
+        water_interval = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
+        season_mult    = {"봄": 0.8, "겨울": 1.5}.get(season, 1.0)
+
+        # 성장일별로 그룹
+        groups: dict[int, list[str]] = {}
+        for c in crops_sorted:
+            groups.setdefault(CROPS[c], []).append(c)
+
+        embed = discord.Embed(
+            title=f"{season_emoji(season)} {season} 작물",
+            description=SEASON_DESC[season],
+            color=SEASON_COLOR[season]
         )
-    embed.set_footer(text="💡 제철 작물은 성장속도 +50% 보너스! | 작물명 옆 이모지는 제철 계절")
-    await interaction.response.send_message(embed=embed)
+
+        for days in sorted(groups):
+            icon       = DAY_ICON.get(days, "🌱")
+            # 제철 기준 성장시간 (제철 보너스 ×0.5 적용)
+            growth_min = round(days * REAL_MINUTES_PER_SERVER_DAY * season_mult * 0.5, 1)
+            waters     = math.ceil(growth_min / water_interval)
+            names      = "  ".join(f"`{c}`" for c in groups[days])
+            embed.add_field(
+                name=f"{icon} {days}일 작물 · 💧 물주기 {waters}회 · ⏱ {growth_min}분",
+                value=names,
+                inline=False
+            )
+
+        embed.set_footer(text=f"💡 /심기 [작물명] {season} — 제철 보너스 +50% 속도!")
+        embeds.append(embed)
+
+    # 안내 embed
+    guide = discord.Embed(
+        title="📖 작물 가이드",
+        color=0x57F287,
+        description=(
+            "**⚡ 1일** — 수확 빠름, 자주 심기 좋음\n"
+            "**🌿 2일** — 무난한 수익\n"
+            "**🌳 3일** — 중간 보상\n"
+            "**🏔️ 4일** — 높은 보상\n"
+            "**💎 5일** — 최고 보상, 오래 걸림\n"
+            "─────────────────\n"
+            "✅ 물주기: 알림 메시지에 ✅ 반응 클릭\n"
+            "🔔 물주기 **1분 전** 미리 알림\n"
+            "🌾 제철 작물 심으면 성장속도 **+50%**"
+        )
+    )
+    embeds.append(guide)
+
+    await interaction.followup.send(embeds=embeds)
 
 
 # ─────────────────────────────────────────
@@ -175,11 +223,10 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str, 계절: str):
         user_tasks.pop(user_id, None)
         user_data.pop(user_id, None)
 
-    growth_min, water_min, in_season = calc_growth(작물, 계절)
-    now          = datetime.now()
+    growth_min, water_min, in_season, total_waters = calc_growth(작물, 계절)
+    now          = datetime.now(KST)
     finish_time  = now + timedelta(minutes=growth_min)
     next_water   = now + timedelta(minutes=water_min)
-    total_waters = total_water_count(작물)
     sem          = season_emoji(계절)
     crop_season  = CROP_SEASON.get(작물, "알 수 없음")
     crop_sem     = season_emoji(crop_season)
@@ -257,7 +304,7 @@ async def water_loop(interaction: discord.Interaction):
             # ── 물주기 메시지 전송 + ✅ 리액션 추가 ──
             data["water_count"] += 1
             current_count = data["water_count"]
-            now       = datetime.now()
+            now       = datetime.now(KST)
 
             # 완료 체크 표시 생성 (완료된 것 ✅, 남은 것 ⬜)
             check_marks = "".join(
@@ -326,7 +373,7 @@ async def water_loop(interaction: discord.Interaction):
                 # 마지막 물주기 → 수확
                 harvest_embed = discord.Embed(
                     title="🌾 수확 완료!",
-                    description=f"{mention} **{crop}** 수확할 시간입니다!\n⏰ `{fmt_time(datetime.now())}`",
+                    description=f"{mention} **{crop}** 수확할 시간입니다!\n⏰ `{fmt_time(datetime.now(KST))}`",
                     color=0xFFD700
                 )
                 harvest_embed.add_field(
@@ -376,7 +423,7 @@ async def cmd_status(interaction: discord.Interaction):
         return
 
     data    = user_data[user_id]
-    now     = datetime.now()
+    now     = datetime.now(KST)
     elapsed = round((now - data["start"]).total_seconds() / 60, 1)
     remain  = round(max(data["growth_min"] - elapsed, 0), 1)
     sem     = season_emoji(data["season"])
