@@ -2,15 +2,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+import json
 from dotenv import load_dotenv
 import asyncio
-import math
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+except ValueError:
+    OWNER_ID = 0
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -61,6 +67,8 @@ BREW_MINUTES   = 240   # 인게임 5일
 # 🗓️ 계절 상태 (메모리)
 # ─────────────────────────────────────────
 current_season: dict[int, str] = {}
+season_task: asyncio.Task | None = None
+state_loaded = False
 
 def get_season(guild_id: int) -> str | None:
     return current_season.get(guild_id)
@@ -88,7 +96,34 @@ brew_tasks:   dict[int, asyncio.Task] = {}
 # ─────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────
-def calc_growth(crop: str, season: str) -> tuple[float, int, bool, int]:
+def save_state():
+    state = {
+        "current_season": {str(gid): season for gid, season in current_season.items()},
+    }
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[save_state] 오류: {e}")
+
+def load_state():
+    global current_season
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        current_season = {
+            int(gid): season
+            for gid, season in state.get("current_season", {}).items()
+            if season in SEASON_ORDER
+        }
+    except Exception as e:
+        print(f"[load_state] 오류: {e}")
+
+def calc_growth(crop: str, season: str) -> tuple[float, int, bool]:
     days         = CROPS[crop]
     base_min     = days * REAL_MINUTES_PER_SERVER_DAY
     season_mult  = {"봄": 0.8, "겨울": 1.5}.get(season, 1.0)
@@ -96,8 +131,7 @@ def calc_growth(crop: str, season: str) -> tuple[float, int, bool, int]:
     bonus        = 0.5 if in_season else 1.0
     final_min    = round(base_min * season_mult * bonus, 1)
     water_min    = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
-    total_waters = math.ceil(final_min / water_min)
-    return final_min, water_min, in_season, total_waters
+    return final_min, water_min, in_season
 
 def fmt_time(dt: datetime) -> str:
     return dt.strftime("%H:%M")
@@ -125,9 +159,6 @@ def cancel_plant(user_id: int, slot: int):
         plant_data[user_id].pop(slot, None)
         if not plant_data[user_id]:
             plant_data.pop(user_id)
-    harvest_events.get(user_id, {}).pop(slot, None)
-    if user_id in harvest_events and not harvest_events[user_id]:
-        harvest_events.pop(user_id, None)
 
 def cancel_water(user_id: int):
     task = water_tasks.pop(user_id, None)
@@ -154,13 +185,133 @@ def get_water_minutes(guild_id: int) -> int:
     season = get_season(guild_id)
     return SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
 
+def required_growth_seconds(data: dict) -> float:
+    return float(data.get("growth_min", 0)) * 60
+
+def current_growth_progress(data: dict, now: datetime | None = None) -> float:
+    now = now or datetime.now(KST)
+    progress = float(data.get("growth_progress_sec", 0))
+    started = data.get("growth_started_at")
+    deadline = data.get("current_deadline")
+
+    if started is not None and deadline is not None:
+        active_until = min(now, deadline)
+        progress += max((active_until - started).total_seconds(), 0)
+
+    return min(progress, required_growth_seconds(data))
+
+def commit_growth_progress(data: dict, now: datetime | None = None):
+    now = now or datetime.now(KST)
+    data["growth_progress_sec"] = current_growth_progress(data, now)
+    data["growth_started_at"] = None
+
+def pause_growth_if_needed(data: dict, now: datetime | None = None) -> bool:
+    now = now or datetime.now(KST)
+    started = data.get("growth_started_at")
+    deadline = data.get("current_deadline")
+    if started is None or deadline is None or now < deadline:
+        return False
+
+    commit_growth_progress(data, deadline)
+    data["current_deadline"] = None
+    data["timer_version"] = data.get("timer_version", 0) + 1
+    return True
+
+async def send_harvest_notice(user_id: int, slot: int, channel: discord.TextChannel, mention: str):
+    if user_id not in plant_data or slot not in plant_data[user_id]:
+        return
+
+    data = plant_data[user_id][slot]
+    crop = data["crop"]
+    season = data["season"]
+    now = datetime.now(KST)
+
+    harvest_embed = discord.Embed(
+        title=f"🌾 {slot_emoji(slot)} 슬롯{slot} — {crop} 수확 완료!",
+        description=f"{mention} **{crop}** 수확하세요!\n⏰ `{fmt_time(now)}`",
+        color=0xFFD700
+    )
+    harvest_embed.add_field(name="재배 시간", value=f"⏱ `{data['growth_min']}분`", inline=True)
+    harvest_embed.add_field(name="계절", value=f"{season_emoji(season)} {season}", inline=True)
+    if season == "가을":
+        harvest_embed.add_field(name="🍂 가을 보너스", value="2.5% 확률로 수확량 2배!", inline=False)
+    await channel.send(content=mention, embed=harvest_embed)
+    cancel_plant(user_id, slot)
+
+def apply_season_to_plants(guild_id: int, season: str):
+    now = datetime.now(KST)
+    for uid, slots in list(plant_data.items()):
+        for slot, pdata in list(slots.items()):
+            if pdata.get("guild_id") != guild_id:
+                continue
+
+            crop = pdata["crop"]
+            old_growth_min = max(pdata.get("growth_min", REAL_MINUTES_PER_SERVER_DAY), 0.1)
+            old_deadline = pdata.get("current_deadline")
+            was_growing = pdata.get("growth_started_at") is not None and old_deadline is not None and now < old_deadline
+            progress_sec = current_growth_progress(pdata, now)
+            progress_ratio = min(progress_sec / max(old_growth_min * 60, 1), 1)
+
+            growth_min, water_min, in_season = calc_growth(crop, season)
+            new_required_sec = growth_min * 60
+            new_progress_sec = min(new_required_sec * progress_ratio, new_required_sec)
+
+            pdata["season"] = season
+            pdata["growth_min"] = growth_min
+            pdata["water_min"] = water_min
+            pdata["in_season"] = in_season
+            pdata["growth_progress_sec"] = new_progress_sec
+            pdata["end"] = now + timedelta(seconds=max(new_required_sec - new_progress_sec, 0))
+            pdata["growth_warn_sent"] = False
+            pdata["timer_version"] = pdata.get("timer_version", 0) + 1
+
+            if was_growing and new_progress_sec < new_required_sec:
+                old_remain = max((old_deadline - now).total_seconds(), 0)
+                old_total = max((old_deadline - pdata["growth_started_at"]).total_seconds(), 1)
+                remain_ratio = old_remain / old_total
+                pdata["growth_started_at"] = now
+                pdata["current_deadline"] = now + timedelta(seconds=water_min * 60 * remain_ratio)
+            else:
+                pdata["growth_started_at"] = None
+                pdata["current_deadline"] = None
+
+def apply_season_to_water(guild_id: int, season: str):
+    new_water_min = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
+    now = datetime.now(KST)
+
+    for uid, wdata in list(water_data.items()):
+        if wdata.get("guild_id") != guild_id:
+            continue
+
+        old_min = wdata.get("water_min", BASE_WATER_MINUTES)
+        next_water = wdata.get("next_water", now)
+        old_remaining = max((next_water - now).total_seconds(), 0)
+        ratio = old_remaining / max(old_min * 60, 1)
+
+        wdata["water_min"] = new_water_min
+        wdata["season"] = season
+        wdata["next_water"] = now + timedelta(seconds=new_water_min * 60 * ratio)
+        wdata["timer_version"] = wdata.get("timer_version", 0) + 1
+
+def change_guild_season(guild_id: int, season: str):
+    current_season[guild_id] = season
+    apply_season_to_water(guild_id, season)
+    apply_season_to_plants(guild_id, season)
+    save_state()
 
 # ─────────────────────────────────────────
 # on_ready
 # ─────────────────────────────────────────
 @bot.event
 async def on_ready():
-    bot.loop.create_task(season_tick())
+    global season_task, state_loaded
+    if not state_loaded:
+        load_state()
+        state_loaded = True
+
+    if season_task is None or season_task.done():
+        season_task = bot.loop.create_task(season_tick())
+
     synced = await bot.tree.sync()
     print(f"✅ {bot.user} 로그인 완료")
     print(f"🌐 전역 동기화 — {len(synced)}개 커맨드")
@@ -186,19 +337,8 @@ async def season_tick():
         for guild_id in list(current_season.keys()):
             prev = current_season[guild_id]
             curr = next_season(prev)
-            current_season[guild_id] = curr
+            change_guild_season(guild_id, curr)
             print(f"[season_tick] guild={guild_id} 계절 변경: {prev} → {curr}")
-
-            new_water_min = SUMMER_WATER_MINUTES if curr == "여름" else BASE_WATER_MINUTES
-            for uid, wdata in list(water_data.items()):
-                if wdata.get("guild_id") == guild_id:
-                    old_min = wdata["water_min"]
-                    if old_min != new_water_min:
-                        last_click = wdata["next_water"] - timedelta(minutes=old_min)
-                        new_next   = last_click + timedelta(minutes=new_water_min)
-                        wdata["water_min"]  = new_water_min
-                        wdata["season"]     = curr
-                        wdata["next_water"] = new_next
 
 
 # ─────────────────────────────────────────
@@ -210,7 +350,7 @@ async def cmd_current_season(interaction: discord.Interaction):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="관리자가 `/계절설정`으로 먼저 계절을 설정해주세요!",
+            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -229,33 +369,30 @@ async def cmd_current_season(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────
-# /계절설정 (관리자)
+# !계절설정 (봇 소유자 전용, 슬래시 명령어에 표시되지 않음)
 # ─────────────────────────────────────────
-@bot.tree.command(name="계절설정", description="[관리자 전용] 현재 계절을 설정합니다")
-@app_commands.describe(계절="설정할 계절")
-@app_commands.choices(계절=[
-    app_commands.Choice(name="🌸 봄",   value="봄"),
-    app_commands.Choice(name="☀️ 여름", value="여름"),
-    app_commands.Choice(name="🍂 가을", value="가을"),
-    app_commands.Choice(name="❄️ 겨울", value="겨울"),
-])
-@app_commands.checks.has_permissions(administrator=True)
-async def cmd_set_season(interaction: discord.Interaction, 계절: str):
-    prev_season = current_season.get(interaction.guild_id)
-    current_season[interaction.guild_id] = 계절
+@bot.command(name="계절설정", hidden=True)
+async def cmd_set_season(ctx: commands.Context, 계절: str = ""):
+    if OWNER_ID == 0:
+        await ctx.send("❌ `.env`에 `OWNER_ID=디스코드_유저_ID`를 먼저 설정해주세요.")
+        return
+
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ 이 명령어는 봇 소유자만 사용할 수 있습니다.")
+        return
+
+    if ctx.guild is None:
+        await ctx.send("❌ 서버 채널에서만 사용할 수 있습니다.")
+        return
+
+    if 계절 not in SEASON_ORDER:
+        await ctx.send("❌ 계절은 `봄`, `여름`, `가을`, `겨울` 중 하나로 입력해주세요. 예: `!계절설정 봄`")
+        return
+
+    prev_season = current_season.get(ctx.guild.id)
+    change_guild_season(ctx.guild.id, 계절)
 
     new_water_min = SUMMER_WATER_MINUTES if 계절 == "여름" else BASE_WATER_MINUTES
-    for uid, wdata in list(water_data.items()):
-        if wdata.get("guild_id") == interaction.guild_id:
-            old_min = wdata["water_min"]
-            if old_min != new_water_min:
-                last_click = wdata["next_water"] - timedelta(minutes=old_min)
-                new_next   = last_click + timedelta(minutes=new_water_min)
-                wdata["water_min"]  = new_water_min
-                wdata["season"]     = 계절
-                wdata["next_water"] = new_next
-            else:
-                wdata["season"] = 계절
 
     nxt = next_season(계절)
     embed = discord.Embed(
@@ -263,7 +400,7 @@ async def cmd_set_season(interaction: discord.Interaction, 계절: str):
         color={"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}.get(계절, 0x57F287)
     )
     embed.add_field(name="현재 계절", value=f"{season_emoji(계절)} **{계절}**", inline=True)
-    embed.add_field(name="다음 계절", value=f"{season_emoji(nxt)} **{nxt}**",   inline=True)
+    embed.add_field(name="다음 계절", value=f"{season_emoji(nxt)} **{nxt}**", inline=True)
     crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(계절, set())))
     embed.add_field(name=f"{season_emoji(계절)} 제철 작물", value=crops_str, inline=False)
     if prev_season and prev_season != 계절:
@@ -273,7 +410,7 @@ async def cmd_set_season(interaction: discord.Interaction, 계절: str):
             inline=False
         )
     embed.set_footer(text="매일 자정(KST)에 자동으로 다음 계절로 넘어갑니다")
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
 
 # ─────────────────────────────────────────
@@ -289,7 +426,6 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="⛔ /물주기취소",          value="진행 중인 물주기 중단",                                    inline=False)
     embed.add_field(name="🌾 /작물목록",            value="모든 작물과 성장 정보 보기",                               inline=False)
     embed.add_field(name="🗓️ /현재계절",           value="현재 서버 계절 확인",                                      inline=False)
-    embed.add_field(name="⚙️ /계절설정 [계절]",    value="[관리자] 계절 설정 (매일 자정 자동 변경, 물주기 간격 즉시 적용)", inline=False)
     embed.add_field(name="─────────────────", value="🫙 **가공 알림**", inline=False)
     embed.add_field(name="🫙 /절임통",             value="절임통 타이머 시작 (인게임 3일 = 144분)",                   inline=False)
     embed.add_field(name="⛔ /절임통취소",          value="진행 중인 절임통 타이머 취소",                             inline=False)
@@ -300,7 +436,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="🚢 /무역종료 [시간]",     value="지정한 시간 뒤 무역 완료 알림 (예: `7시35분` / `30분` / `2시`)", inline=False)
     embed.add_field(name="🏳️ /무역포기",           value="무역 포기 + 3시간 뒤 재확인 알림",                         inline=False)
     embed.add_field(name="⛔ /무역타이머취소",      value="진행 중인 무역 타이머 취소",                               inline=False)
-    embed.set_footer(text="서버 1일 = 현실 48분 | 자정(KST) 기준 계절 자동 변경")
+    embed.set_footer(text="서버 1일 = 현실 48분 | 자정(KST) 기준 계절 자동 변경\n🌱 물을 준 동안만 작물이 성장하고, 다음 물주기를 놓치면 성장이 멈춥니다")
     await interaction.response.send_message(embed=embed)
 
 
@@ -336,9 +472,9 @@ async def cmd_croplist(interaction: discord.Interaction):
         for days in sorted(groups):
             lines = []
             for c in groups[days]:
-                g_min, w_min, in_s, w_count = calc_growth(c, season)
+                g_min, w_min, in_s = calc_growth(c, season)
                 bonus = "✅제철" if in_s else "➖비제철"
-                lines.append(f"`{c}` {bonus} · ⏱{g_min}분 · 💧{w_count}회")
+                lines.append(f"`{c}` {bonus} · ⏱{g_min}분")
             embed.add_field(
                 name=f"{DAY_ICON.get(days,'🌱')} {days}일 작물",
                 value="\n".join(lines),
@@ -359,7 +495,9 @@ async def cmd_croplist(interaction: discord.Interaction):
             "─────────────────\n"
             f"🌱 심기 슬롯 최대 **{MAX_SLOTS}개**\n"
             "💧 물주기 슬롯 최대 **1개** (유저당)\n"
-            "🌾 물주기 횟수를 다 채우면 수확 알림\n"
+            "⏱️ 작물은 물주기 ✅ 후 다음 물주기 시간까지 성장\n"
+            "⏸️ 다음 물주기를 놓치면 성장 정지\n"
+            "🌾 필요한 성장 시간을 다 채우면 수확 알림\n"
             "🔔 서버 누구든 ✅ 클릭 시점부터 다음 물주기 타이머 시작"
         )
     )
@@ -377,7 +515,7 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="관리자가 `/계절설정`으로 먼저 계절을 설정해야 합니다!",
+            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -406,9 +544,8 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
         ), ephemeral=True)
         return
 
-    growth_min, water_min, in_season, total_waters = calc_growth(작물, season)
+    growth_min, water_min, in_season = calc_growth(작물, season)
     now         = datetime.now(KST)
-    finish_time = now + timedelta(minutes=growth_min)
     sem         = season_emoji(season)
     crop_season = CROP_SEASON.get(작물, "알 수 없음")
     crop_sem    = season_emoji(crop_season)
@@ -416,9 +553,14 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     plant_data.setdefault(user_id, {})[slot] = {
         "crop": 작물, "season": season, "growth_min": growth_min,
         "water_min": water_min, "in_season": in_season,
-        "start": now, "end": finish_time,
-        "total_waters": total_waters,
-        "water_done": 0,
+        "start": now, "end": now + timedelta(minutes=growth_min),
+        # 마지막 물주기 완료 시각 기록용
+        "last_water_click": None,
+        "growth_progress_sec": 0,
+        "growth_started_at": None,
+        # 현재 물주기 회차 기준 다음 물주기 예상 시각
+        "current_deadline": None,
+        "timer_version": 0,
         "user_mention": interaction.user.mention,
         "channel_id": interaction.channel_id,
         "guild_id": interaction.guild_id,
@@ -443,11 +585,16 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     embed.add_field(name="현재 계절",      value=f"{sem} {season}",               inline=True)
     embed.add_field(name="이 작물의 제철", value=f"{crop_sem} {crop_season}",     inline=True)
     embed.add_field(name="제철 여부",      value=bonus_text,                      inline=False)
-    embed.add_field(name="필요 물주기",    value=f"💧 `{total_waters}회` (물주기는 `/물주기` 사용)", inline=False)
+    embed.add_field(name="필요 성장 시간", value=f"⏱ `{growth_min}분`", inline=True)
     embed.add_field(name="내 심기 현황",   value=slot_status,                     inline=False)
+    embed.add_field(
+        name="⏱️ 수확 조건",
+        value="물주기 ✅를 누른 뒤 다음 물주기 시간까지 성장합니다. 물을 안 주면 성장이 멈춥니다.",
+        inline=False
+    )
     if season == "가을":
         embed.add_field(name="특이사항", value="🍂 수확 시 2.5% 확률로 수확량 2배!", inline=False)
-    embed.set_footer(text=f"심기 슬롯 {slot}/{MAX_SLOTS} | 물주기를 다 채워야 수확 알림이 옵니다!")
+    embed.set_footer(text=f"심기 슬롯 {slot}/{MAX_SLOTS} | 물을 준 동안만 성장합니다!")
 
     await interaction.response.send_message(content=interaction.user.mention, embed=embed)
     plant_tasks.setdefault(user_id, {})[slot] = bot.loop.create_task(
@@ -455,51 +602,55 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     )
 
 
-# ─────────────────────────────────────────
-# 🌾 수확 타이머 — 물주기 횟수 기반
-# ─────────────────────────────────────────
+
+
 async def harvest_timer(user_id: int, slot: int, channel: discord.TextChannel, mention: str):
     try:
         if user_id not in plant_data or slot not in plant_data[user_id]:
             return
 
-        data    = plant_data[user_id][slot]
-        crop    = data["crop"]
-        season  = data["season"]
-        total_w = data["total_waters"]
+        while True:
+            if user_id not in plant_data or slot not in plant_data[user_id]:
+                return
 
-        # 수확 완료 이벤트 등록
-        event = asyncio.Event()
-        harvest_events.setdefault(user_id, {})[slot] = event
+            data = plant_data[user_id][slot]
+            crop = data["crop"]
+            version = data.get("timer_version", 0)
+            now = datetime.now(KST)
+            pause_growth_if_needed(data, now)
+            progress = current_growth_progress(data, now)
+            required = required_growth_seconds(data)
+            remain_sec = max(required - progress, 0)
+            is_growing = data.get("growth_started_at") is not None and data.get("current_deadline") is not None
 
-        # 물주기 횟수가 다 찰 때까지 대기
-        await event.wait()
+            if remain_sec <= 0:
+                await send_harvest_notice(user_id, slot, channel, mention)
+                return
 
-        if user_id not in plant_data or slot not in plant_data[user_id]:
-            return
+            if not is_growing:
+                await asyncio.sleep(5)
+                continue
 
-        now = datetime.now(KST)
-        harvest_embed = discord.Embed(
-            title=f"🌾 {slot_emoji(slot)} 슬롯{slot} — {crop} 수확 완료!",
-            description=f"{mention} **{crop}** 수확하세요!\n⏰ `{fmt_time(now)}`",
-            color=0xFFD700
-        )
-        harvest_embed.add_field(name="총 물주기 횟수", value=f"💧 `{total_w}회`", inline=True)
-        harvest_embed.add_field(name="계절",           value=f"{season_emoji(season)} {season}", inline=True)
-        if season == "가을":
-            harvest_embed.add_field(name="🍂 가을 보너스", value="2.5% 확률로 수확량 2배!", inline=False)
+            if remain_sec <= 60 and not data.get("growth_warn_sent"):
+                await channel.send(embed=discord.Embed(
+                    title=f"🔔 {slot_emoji(slot)} 슬롯{slot} — {crop} 재배 완료 1분 전!",
+                    description=f"{mention} **{crop}** 재배 시간이 **1분 후** 완료됩니다.",
+                    color=0xFEE75C
+                ))
+                data["growth_warn_sent"] = True
 
-        cancel_plant(user_id, slot)
-        await channel.send(content=mention, embed=harvest_embed)
+            deadline = data.get("current_deadline")
+            wait_sec = min(remain_sec, max((deadline - now).total_seconds(), 0), 5)
+            await asyncio.sleep(max(wait_sec, 1))
+            if user_id in plant_data and slot in plant_data[user_id]:
+                if plant_data[user_id][slot].get("timer_version", 0) != version:
+                    continue
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
         print(f"[harvest_timer] 오류 (user={user_id}, slot={slot}): {e}")
     finally:
-        harvest_events.get(user_id, {}).pop(slot, None)
-        if user_id in harvest_events and not harvest_events[user_id]:
-            harvest_events.pop(user_id, None)
         plant_tasks.get(user_id, {}).pop(slot, None)
         if user_id in plant_tasks and not plant_tasks[user_id]:
             plant_tasks.pop(user_id, None)
@@ -514,7 +665,7 @@ async def cmd_water(interaction: discord.Interaction):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="관리자가 `/계절설정`으로 먼저 계절을 설정해야 합니다!",
+            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -540,6 +691,7 @@ async def cmd_water(interaction: discord.Interaction):
         "water_count": 0,
         "next_water": now,
         "start": now,
+        "timer_version": 0,
         "user_mention": interaction.user.mention,
         "channel_id": interaction.channel_id,
     }
@@ -549,6 +701,7 @@ async def cmd_water(interaction: discord.Interaction):
     embed.add_field(name="물주기 간격", value=f"⏱ `{water_min}분`마다",      inline=True)
     embed.add_field(name="반복",        value="♾️ `/물주기취소`까지 무한반복", inline=True)
     embed.add_field(name="타이머 기준", value="✅ 서버 누구든 클릭 시점부터 카운트", inline=True)
+    embed.add_field(name="🌱 작물 성장", value="✅ 클릭 후 다음 물주기 시간까지 작물이 성장합니다. 다음 물주기를 놓치면 성장이 멈춥니다.", inline=False)
     embed.set_footer(text="지금 바로 ✅ 반응 클릭해서 첫 물주기!")
 
     await interaction.response.send_message(embed=embed)
@@ -570,6 +723,49 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             water_min     = data["water_min"]
             current_count = data["water_count"]
             season        = data["season"]
+            version       = data.get("timer_version", 0)
+            next_water    = data.get("next_water", datetime.now(KST))
+
+            if current_count > 0 and next_water > datetime.now(KST):
+                wait_sec = max((next_water - datetime.now(KST)).total_seconds() - 60, 0)
+                slept = 0.0
+                while slept < wait_sec:
+                    await asyncio.sleep(min(5.0, wait_sec - slept))
+                    slept += 5.0
+                    if user_id not in water_data:
+                        break
+                    if water_data[user_id].get("timer_version", 0) != version:
+                        break
+
+                if user_id not in water_data:
+                    break
+                data = water_data[user_id]
+                if data.get("timer_version", 0) != version:
+                    continue
+
+                await channel.send(embed=discord.Embed(
+                    title="🔔 물주기 1분 전!",
+                    description=(
+                        f"{mention} 물주기 **1분 전**! 준비하세요 💧\n"
+                        f"(누적 `{current_count}회` 완료 | {season_emoji(data['season'])} {data['season']} 기준 `{data['water_min']}분`마다)"
+                    ),
+                    color=0xFEE75C
+                ))
+
+                wait_sec = max((data["next_water"] - datetime.now(KST)).total_seconds(), 0)
+                slept = 0.0
+                while slept < wait_sec:
+                    await asyncio.sleep(min(5.0, wait_sec - slept))
+                    slept += 5.0
+                    if user_id not in water_data:
+                        break
+                    if water_data[user_id].get("timer_version", 0) != version:
+                        break
+
+                if user_id not in water_data:
+                    break
+                if water_data[user_id].get("timer_version", 0) != version:
+                    continue
 
             water_embed = discord.Embed(
                 title="💧 물주기 시간입니다!",
@@ -618,33 +814,25 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             data          = water_data[user_id]
             water_min     = data["water_min"]
             season        = data["season"]
+            version       = data.get("timer_version", 0)
 
             data["water_count"] += 1
-            current_count   = data["water_count"]
-            click_time      = datetime.now(KST)
-            next_water_time = click_time + timedelta(minutes=water_min)
+            current_count    = data["water_count"]
+            click_time       = datetime.now(KST)
+            next_water_time  = click_time + timedelta(minutes=water_min)
             data["next_water"] = next_water_time
 
-            # ── 심기 슬롯 물주기 진행 반영 ──────────────────────
+            # ── 심기 슬롯 성장 시작/연장 반영 ──────────────────────
+            # 다음 물주기 시간까지 작물 성장을 진행시킨다.
             if user_id in plant_data:
                 for slot, pdata in list(plant_data[user_id].items()):
-                    pdata["water_done"] = pdata.get("water_done", 0) + 1
-                    done  = pdata["water_done"]
-                    total = pdata["total_waters"]
-                    crop  = pdata["crop"]
-
-                    if done == total - 1:
-                        # 마지막 1회 남음 예고
-                        await channel.send(embed=discord.Embed(
-                            title=f"🔔 {slot_emoji(slot)} 슬롯{slot} — {crop} 물주기 1회 남음!",
-                            description=f"{pdata['user_mention']} **{crop}** 다음 물주기 후 수확 가능합니다! 🌾",
-                            color=0xFEE75C
-                        ))
-                    elif done >= total:
-                        # 수확 이벤트 발동
-                        event = harvest_events.get(user_id, {}).get(slot)
-                        if event:
-                            event.set()
+                    pause_growth_if_needed(pdata, click_time)
+                    commit_growth_progress(pdata, click_time)
+                    pdata["last_water_click"] = click_time   # ← 타이머 트리거
+                    pdata["growth_started_at"] = click_time
+                    pdata["current_deadline"] = click_time + timedelta(minutes=pdata["water_min"])
+                    pdata["growth_warn_sent"] = False
+                    pdata["timer_version"]    = pdata.get("timer_version", 0) + 1
 
             confirm = discord.Embed(
                 title="✅ 물주기 완료!",
@@ -662,7 +850,16 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             confirm.add_field(name="물주기 간격", value=f"⏱ `{water_min}분` ({season_emoji(season)} {season} 기준)", inline=True)
             await channel.send(embed=confirm)
 
-            await asyncio.sleep(max(water_min - 1, 0) * 60)
+            wait_sec = max(water_min - 1, 0) * 60
+            slept = 0.0
+            while slept < wait_sec:
+                await asyncio.sleep(min(5.0, wait_sec - slept))
+                slept += 5.0
+                if user_id not in water_data:
+                    break
+                data = water_data[user_id]
+                if data.get("timer_version", 0) != version:
+                    break
 
             if user_id not in water_data:
                 break
@@ -670,6 +867,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             data      = water_data[user_id]
             water_min = data["water_min"]
             season    = data["season"]
+            if data.get("timer_version", 0) != version:
+                continue
 
             await channel.send(embed=discord.Embed(
                 title="🔔 물주기 1분 전!",
@@ -680,7 +879,14 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                 color=0xFEE75C
             ))
 
-            await asyncio.sleep(60)
+            slept = 0.0
+            while slept < 60:
+                await asyncio.sleep(min(5.0, 60 - slept))
+                slept += 5.0
+                if user_id not in water_data:
+                    break
+                if water_data[user_id].get("timer_version", 0) != version:
+                    break
 
     except asyncio.CancelledError:
         pass
@@ -719,16 +925,29 @@ async def cmd_status(interaction: discord.Interaction):
             color=0x57F287
         )
         for slot in sorted(p_slots.keys()):
-            d             = p_slots[slot]
-            done          = d.get("water_done", 0)
-            total         = d["total_waters"]
-            remaining_w   = total - done
+            d          = p_slots[slot]
+            pause_growth_if_needed(d, now)
+            progress_sec = current_growth_progress(d, now)
+            required_sec = required_growth_seconds(d)
+            growth_remain = max(round((required_sec - progress_sec) / 60, 1), 0)
+            progress_min = round(progress_sec / 60, 1)
+            required_min = round(required_sec / 60, 1)
+
+            if growth_remain <= 0:
+                timer_str = "🌾 수확 가능"
+            elif d.get("growth_started_at") is not None and d.get("current_deadline") is not None:
+                deadline = d["current_deadline"]
+                active_remain = max(round((deadline - now).total_seconds() / 60, 1), 0)
+                timer_str = f"⏳ 성장 중 (`{growth_remain}분` 남음, 이번 물주기 `{active_remain}분` 남음)"
+            else:
+                timer_str = f"⏸️ 성장 정지 중 (다음 물주기 필요)"
+
             summary.add_field(
                 name=f"{slot_emoji(slot)} 슬롯{slot} — {d['crop']}",
                 value=(
                     f"{season_emoji(d['season'])} `{d['season']}` · "
-                    f"💧 물주기 `{done}/{total}회` · "
-                    f"남은 횟수 `{remaining_w}회`"
+                    f"⏱ 성장 `{progress_min}/{required_min}분` · "
+                    f"{timer_str}"
                 ),
                 inline=False
             )
