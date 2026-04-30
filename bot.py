@@ -16,7 +16,8 @@ try:
 except ValueError:
     OWNER_ID = 0
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+STATE_FILE = os.getenv("STATE_FILE") or os.path.join(BASE_DIR, "wispbyte_state.json")
+STATE_FILE_MIN_BYTES = 1024
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -70,7 +71,9 @@ current_season: dict[int, str] = {}
 season_task: asyncio.Task | None = None
 state_loaded = False
 
-def get_season(guild_id: int) -> str | None:
+def get_season(guild_id: int | None) -> str | None:
+    if guild_id is None:
+        return None
     return current_season.get(guild_id)
 
 def next_season(season: str) -> str:
@@ -100,11 +103,25 @@ def save_state():
     state = {
         "current_season": {str(gid): season for gid, season in current_season.items()},
     }
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        if not os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                f.write("{}" + (" " * (STATE_FILE_MIN_BYTES - 2)))
+
+        current_size = os.path.getsize(STATE_FILE)
+        if len(payload) > current_size:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                f.write(payload)
+        else:
+            with open(STATE_FILE, "r+", encoding="utf-8") as f:
+                f.seek(0)
+                f.write(payload)
+                f.write(" " * (current_size - len(payload)))
+                f.flush()
     except Exception as e:
-        print(f"[save_state] 오류: {e}")
+        print(f"[save_state] 오류: {e} (경로: {STATE_FILE}, 크기: {len(payload)} bytes)")
 
 def load_state():
     global current_season
@@ -122,6 +139,17 @@ def load_state():
         }
     except Exception as e:
         print(f"[load_state] 오류: {e}")
+
+async def safe_interaction_error(interaction: discord.Interaction, embed: discord.Embed):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except discord.NotFound:
+        print("[interaction] expired before error response could be sent")
+    except discord.HTTPException as e:
+        print(f"[interaction] error response failed: {e}")
 
 def calc_growth(crop: str, season: str) -> tuple[float, int, bool]:
     days         = CROPS[crop]
@@ -350,7 +378,7 @@ async def cmd_current_season(interaction: discord.Interaction):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
+            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -365,6 +393,51 @@ async def cmd_current_season(interaction: discord.Interaction):
     crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(season, set())))
     embed.add_field(name=f"{season_emoji(season)} 제철 작물", value=crops_str, inline=False)
     embed.set_footer(text="매일 자정(KST) 자동으로 다음 계절로 넘어갑니다")
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────
+# /계절설정
+# ─────────────────────────────────────────
+@bot.tree.command(name="계절설정", description="이 서버의 계절을 설정합니다")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(계절=[
+    app_commands.Choice(name="봄", value="봄"),
+    app_commands.Choice(name="여름", value="여름"),
+    app_commands.Choice(name="가을", value="가을"),
+    app_commands.Choice(name="겨울", value="겨울"),
+])
+async def cmd_set_season_slash(interaction: discord.Interaction, 계절: app_commands.Choice[str]):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("❌ 서버 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    if not permissions or not permissions.administrator:
+        await interaction.response.send_message("❌ 이 명령어는 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    prev_season = current_season.get(interaction.guild_id)
+    season = 계절.value
+    change_guild_season(interaction.guild_id, season)
+
+    new_water_min = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
+    nxt = next_season(season)
+    embed = discord.Embed(
+        title="✅ 이 서버 계절 설정 완료",
+        color={"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}.get(season, 0x57F287)
+    )
+    embed.add_field(name="현재 계절", value=f"{season_emoji(season)} **{season}**", inline=True)
+    embed.add_field(name="다음 계절", value=f"{season_emoji(nxt)} **{nxt}**", inline=True)
+    crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(season, set())))
+    embed.add_field(name=f"{season_emoji(season)} 제철 작물", value=crops_str, inline=False)
+    if prev_season and prev_season != season:
+        embed.add_field(
+            name="💧 물주기 간격 변경",
+            value=f"이 서버에서 진행 중인 물주기 간격이 **{new_water_min}분**으로 자동 변경되었습니다.",
+            inline=False
+        )
+    embed.set_footer(text="이 설정은 현재 서버에만 적용됩니다")
     await interaction.response.send_message(embed=embed)
 
 
@@ -396,7 +469,7 @@ async def cmd_set_season(ctx: commands.Context, 계절: str = ""):
 
     nxt = next_season(계절)
     embed = discord.Embed(
-        title="✅ 계절 설정 완료",
+        title="✅ 이 서버 계절 설정 완료",
         color={"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}.get(계절, 0x57F287)
     )
     embed.add_field(name="현재 계절", value=f"{season_emoji(계절)} **{계절}**", inline=True)
@@ -409,7 +482,7 @@ async def cmd_set_season(ctx: commands.Context, 계절: str = ""):
             value=f"진행 중인 물주기 간격이 **{new_water_min}분**으로 자동 변경되었습니다.",
             inline=False
         )
-    embed.set_footer(text="매일 자정(KST)에 자동으로 다음 계절로 넘어갑니다")
+    embed.set_footer(text="이 설정은 현재 서버에만 적용됩니다 · 매일 자정(KST)에 자동으로 다음 계절로 넘어갑니다")
     await ctx.send(embed=embed)
 
 
@@ -426,6 +499,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="⛔ /물주기취소",          value="진행 중인 물주기 중단",                                    inline=False)
     embed.add_field(name="🌾 /작물목록",            value="모든 작물과 성장 정보 보기",                               inline=False)
     embed.add_field(name="🗓️ /현재계절",           value="현재 서버 계절 확인",                                      inline=False)
+    embed.add_field(name="🗓️ /계절설정 [계절]",     value="현재 서버 계절 설정 (서버 관리자)",                         inline=False)
     embed.add_field(name="─────────────────", value="🫙 **가공 알림**", inline=False)
     embed.add_field(name="🫙 /절임통",             value="절임통 타이머 시작 (인게임 3일 = 144분)",                   inline=False)
     embed.add_field(name="⛔ /절임통취소",          value="진행 중인 절임통 타이머 취소",                             inline=False)
@@ -515,7 +589,7 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
+            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -661,11 +735,17 @@ async def harvest_timer(user_id: int, slot: int, channel: discord.TextChannel, m
 # ─────────────────────────────────────────
 @bot.tree.command(name="물주기", description="물주기 타이머를 시작합니다 (서버 누구든 ✅ 클릭 시점 기준, 무한반복)")
 async def cmd_water(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(thinking=True)
+    except discord.NotFound:
+        print("[cmd_water] interaction expired before defer")
+        return
+
     season = get_season(interaction.guild_id)
     if not season:
-        await interaction.response.send_message(embed=discord.Embed(
+        await interaction.followup.send(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="봇 소유자가 먼저 계절을 설정해야 합니다.",
+            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -673,7 +753,7 @@ async def cmd_water(interaction: discord.Interaction):
     user_id = interaction.user.id
 
     if user_id in water_data:
-        await interaction.response.send_message(embed=discord.Embed(
+        await interaction.followup.send(embed=discord.Embed(
             title="⚠️ 이미 물주기 진행 중",
             description="`/물주기취소`로 먼저 중단한 뒤 다시 시작하세요.",
             color=0xFEE75C
@@ -704,7 +784,7 @@ async def cmd_water(interaction: discord.Interaction):
     embed.add_field(name="🌱 작물 성장", value="✅ 클릭 후 다음 물주기 시간까지 작물이 성장합니다. 다음 물주기를 놓치면 성장이 멈춥니다.", inline=False)
     embed.set_footer(text="지금 바로 ✅ 반응 클릭해서 첫 물주기!")
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
     water_tasks[user_id] = bot.loop.create_task(
         water_loop(user_id, interaction.channel, interaction.user.mention)
     )
@@ -1429,10 +1509,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         desc, color = f"예기치 않은 오류\n```{str(error)}```", 0xED4245
 
     embed = discord.Embed(title="⚠️ 오류", description=desc, color=color)
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    await safe_interaction_error(interaction, embed)
 
 
 # ─────────────────────────────────────────
