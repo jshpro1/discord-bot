@@ -73,7 +73,6 @@ def next_season(season: str) -> str:
 # ─────────────────────────────────────────
 plant_data:  dict[int, dict[int, dict]]         = {}
 plant_tasks: dict[int, dict[int, asyncio.Task]] = {}
-harvest_events: dict[int, dict[int, asyncio.Event]] = {}
 
 water_data:  dict[int, dict]         = {}
 water_tasks: dict[int, asyncio.Task] = {}
