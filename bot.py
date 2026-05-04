@@ -17,13 +17,59 @@ except ValueError:
     OWNER_ID = 0
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.getenv("STATE_FILE") or os.path.join(BASE_DIR, "wispbyte_state.json")
-STATE_FILE_MIN_BYTES = 1024
+STATE_BACKUP_FILE = f"{STATE_FILE}.bak"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+CHANNEL_SEND_INTERVAL_SECONDS = 3
+commands_synced = False
+
+def get_retry_after(error: discord.HTTPException, default: float = CHANNEL_SEND_INTERVAL_SECONDS) -> float:
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is None:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after is None:
+        text = getattr(error, "text", None)
+        if isinstance(text, dict):
+            retry_after = text.get("retry_after")
+        elif isinstance(text, str):
+            try:
+                retry_after = json.loads(text).get("retry_after")
+            except (ValueError, TypeError, AttributeError):
+                retry_after = None
+    try:
+        return max(float(retry_after), 0)
+    except (TypeError, ValueError):
+        return default
+
+class RateLimitedMessenger:
+    def __init__(self, interval_seconds: float):
+        self.interval_seconds = interval_seconds
+        self._lock = asyncio.Lock()
+
+    async def send(self, channel: discord.abc.Messageable, *args, **kwargs):
+        async with self._lock:
+            while True:
+                try:
+                    message = await channel.send(*args, **kwargs)
+                    await asyncio.sleep(self.interval_seconds)
+                    return message
+                except discord.HTTPException as e:
+                    if getattr(e, "status", None) != 429:
+                        raise
+                    retry_after = get_retry_after(e, self.interval_seconds)
+                    print(f"[rate_limit] channel.send blocked; retrying after {retry_after:.2f}s")
+                    await asyncio.sleep(retry_after + 1)
+
+messenger = RateLimitedMessenger(CHANNEL_SEND_INTERVAL_SECONDS)
+
+async def safe_channel_send(channel: discord.abc.Messageable, *args, **kwargs):
+    return await messenger.send(channel, *args, **kwargs)
 
 # ─────────────────────────────────────────
 # 🌱 작물 데이터
@@ -68,13 +114,24 @@ BREW_MINUTES   = 240   # 인게임 5일
 # 🗓️ 계절 상태 (메모리)
 # ─────────────────────────────────────────
 current_season: dict[int, str] = {}
+default_season = "가을"
 season_task: asyncio.Task | None = None
 state_loaded = False
 
-def get_season(guild_id: int | None) -> str | None:
+def get_season(guild_id: int | None, *, auto_create: bool = True) -> str | None:
     if guild_id is None:
         return None
+    if guild_id not in current_season and auto_create:
+        current_season[guild_id] = default_season
+        save_state()
+        print(f"[season] guild={guild_id} 기본 계절 자동 설정: {default_season}")
     return current_season.get(guild_id)
+
+def ensure_guild_season(guild_id: int) -> str:
+    season = get_season(guild_id)
+    if season is None:
+        raise ValueError("guild_id is required")
+    return season
 
 def next_season(season: str) -> str:
     return SEASON_ORDER[(SEASON_ORDER.index(season) + 1) % 4]
@@ -89,56 +146,146 @@ water_data:  dict[int, dict]         = {}
 water_tasks: dict[int, asyncio.Task] = {}
 
 # 무역
+trade_data:  dict[int, dict]         = {}
 trade_tasks: dict[int, asyncio.Task] = {}
 
 # 절임통 / 양조통
+pickle_data: dict[int, dict]         = {}
 pickle_tasks: dict[int, asyncio.Task] = {}
+brew_data:   dict[int, dict]         = {}
 brew_tasks:   dict[int, asyncio.Task] = {}
 
 
 # ─────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────
+def encode_state_value(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): encode_state_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [encode_state_value(v) for v in value]
+    return value
+
+def parse_state_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+            return dt if dt.tzinfo else dt.replace(tzinfo=KST)
+        except ValueError:
+            return None
+    return None
+
+def decode_state_datetimes(data: dict) -> dict:
+    dt_fields = {
+        "start", "end", "last_water_click", "growth_started_at",
+        "current_deadline", "next_water", "finish_time",
+    }
+    decoded = dict(data)
+    for field in dt_fields:
+        if field in decoded:
+            decoded[field] = parse_state_datetime(decoded.get(field))
+    return decoded
+
+def decode_timer_dict(raw: dict | None, *, nested_slots: bool = False) -> dict:
+    decoded = {}
+    if not isinstance(raw, dict):
+        return decoded
+
+    for raw_key, raw_value in raw.items():
+        if not str(raw_key).isdigit():
+            continue
+        key = int(raw_key)
+        if nested_slots:
+            slots = {}
+            if isinstance(raw_value, dict):
+                for raw_slot, slot_value in raw_value.items():
+                    if str(raw_slot).isdigit() and isinstance(slot_value, dict):
+                        slots[int(raw_slot)] = decode_state_datetimes(slot_value)
+            if slots:
+                decoded[key] = slots
+        elif isinstance(raw_value, dict):
+            decoded[key] = decode_state_datetimes(raw_value)
+
+    return decoded
+
 def save_state():
     state = {
+        "default_season": default_season,
         "current_season": {str(gid): season for gid, season in current_season.items()},
+        "plant_data": encode_state_value(plant_data),
+        "water_data": encode_state_value(water_data),
+        "pickle_data": encode_state_value(pickle_data),
+        "brew_data": encode_state_value(brew_data),
+        "trade_data": encode_state_value(trade_data),
     }
-    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    tmp_file = f"{STATE_FILE}.tmp"
     try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        if not os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                f.write("{}" + (" " * (STATE_FILE_MIN_BYTES - 2)))
-
-        current_size = os.path.getsize(STATE_FILE)
-        if len(payload) > current_size:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                f.write(payload)
-        else:
-            with open(STATE_FILE, "r+", encoding="utf-8") as f:
-                f.seek(0)
-                f.write(payload)
-                f.write(" " * (current_size - len(payload)))
-                f.flush()
+        state_dir = os.path.dirname(STATE_FILE)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            f.write(payload)
+        if os.path.exists(STATE_FILE):
+            os.replace(STATE_FILE, STATE_BACKUP_FILE)
+        os.replace(tmp_file, STATE_FILE)
     except Exception as e:
         print(f"[save_state] 오류: {e} (경로: {STATE_FILE}, 크기: {len(payload)} bytes)")
 
 def load_state():
-    global current_season
-    if not os.path.exists(STATE_FILE):
+    global default_season
+    state = None
+    loaded_path = None
+    for state_path in (STATE_FILE, STATE_BACKUP_FILE):
+        if not os.path.exists(state_path):
+            continue
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            loaded_path = state_path
+            break
+        except Exception as e:
+            print(f"[load_state] 오류: {e} (경로: {state_path})")
+
+    if not isinstance(state, dict):
         return
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
+        loaded_default = (
+            state.get("default_season")
+            or state.get("season")
+            or state.get("current_season", {}).get("default")
+        )
+        if loaded_default in SEASON_ORDER:
+            default_season = loaded_default
 
-        current_season = {
+        loaded_current_season = {
             int(gid): season
             for gid, season in state.get("current_season", {}).items()
-            if season in SEASON_ORDER
+            if str(gid).isdigit() and season in SEASON_ORDER
         }
+
+        current_season.clear()
+        current_season.update(loaded_current_season)
+        plant_data.clear()
+        plant_data.update(decode_timer_dict(state.get("plant_data"), nested_slots=True))
+        water_data.clear()
+        water_data.update(decode_timer_dict(state.get("water_data")))
+        pickle_data.clear()
+        pickle_data.update(decode_timer_dict(state.get("pickle_data")))
+        brew_data.clear()
+        brew_data.update(decode_timer_dict(state.get("brew_data")))
+        trade_data.clear()
+        trade_data.update(decode_timer_dict(state.get("trade_data")))
+        print(f"[load_state] loaded from {loaded_path}")
     except Exception as e:
-        print(f"[load_state] 오류: {e}")
+        print(f"[load_state] 상태 적용 오류: {e} (경로: {loaded_path})")
 
 async def safe_interaction_error(interaction: discord.Interaction, embed: discord.Embed):
     try:
@@ -149,20 +296,34 @@ async def safe_interaction_error(interaction: discord.Interaction, embed: discor
     except discord.NotFound:
         print("[interaction] expired before error response could be sent")
     except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            retry_after = get_retry_after(e)
+            print(f"[rate_limit] interaction error response blocked; cooling down {retry_after:.2f}s")
+            await asyncio.sleep(retry_after + 1)
+            return
         print(f"[interaction] error response failed: {e}")
 
 def calc_growth(crop: str, season: str) -> tuple[float, int, bool]:
     days         = CROPS[crop]
     base_min     = days * REAL_MINUTES_PER_SERVER_DAY
-    season_mult  = {"봄": 0.8, "겨울": 1.5}.get(season, 1.0)
     in_season    = crop in SEASON_CROPS.get(season, set())
-    bonus        = 0.5 if in_season else 1.0
-    final_min    = round(base_min * season_mult * bonus, 1)
+    season_speed = 1.0
+    if season == "봄":
+        season_speed += 0.2
+    elif season == "겨울":
+        season_speed -= 0.5
+    growth_speed = season_speed + (0.5 if in_season else 0.0)
+    final_min    = round(base_min / growth_speed, 1)
     water_min    = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
     return final_min, water_min, in_season
 
 def fmt_time(dt: datetime) -> str:
     return dt.strftime("%H:%M")
+
+def timer_remaining_minutes(finish_time: datetime | None, now: datetime) -> float:
+    if finish_time is None:
+        return 0
+    return max(round((finish_time - now).total_seconds() / 60, 1), 0)
 
 def season_emoji(season: str) -> str:
     return {"봄": "🌸", "여름": "☀️", "가을": "🍂", "겨울": "❄️"}.get(season, "🌿")
@@ -187,27 +348,67 @@ def cancel_plant(user_id: int, slot: int):
         plant_data[user_id].pop(slot, None)
         if not plant_data[user_id]:
             plant_data.pop(user_id)
+    save_state()
 
 def cancel_water(user_id: int):
     task = water_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
     water_data.pop(user_id, None)
+    save_state()
 
 def cancel_trade(user_id: int):
     task = trade_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
+    trade_data.pop(user_id, None)
+    save_state()
 
 def cancel_pickle(user_id: int):
     task = pickle_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
+    pickle_data.pop(user_id, None)
+    save_state()
 
 def cancel_brew(user_id: int):
     task = brew_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
+    brew_data.pop(user_id, None)
+    save_state()
+
+def cancel_task_map(task_map: dict):
+    for task in list(task_map.values()):
+        if isinstance(task, dict):
+            cancel_task_map(task)
+        elif task and not task.done():
+            task.cancel()
+    task_map.clear()
+
+def reset_non_season_state() -> dict[str, int]:
+    counts = {
+        "plant": sum(len(slots) for slots in plant_data.values()),
+        "water": len(water_data),
+        "pickle": len(pickle_data),
+        "brew": len(brew_data),
+        "trade": len(trade_data),
+    }
+
+    cancel_task_map(plant_tasks)
+    cancel_task_map(water_tasks)
+    cancel_task_map(pickle_tasks)
+    cancel_task_map(brew_tasks)
+    cancel_task_map(trade_tasks)
+
+    plant_data.clear()
+    water_data.clear()
+    pickle_data.clear()
+    brew_data.clear()
+    trade_data.clear()
+
+    save_state()
+    return counts
 
 def get_water_minutes(guild_id: int) -> int:
     season = get_season(guild_id)
@@ -245,6 +446,19 @@ def pause_growth_if_needed(data: dict, now: datetime | None = None) -> bool:
     data["timer_version"] = data.get("timer_version", 0) + 1
     return True
 
+def get_wet_soil_deadline(user_id: int, guild_id: int | None, now: datetime | None = None) -> datetime | None:
+    now = now or datetime.now(KST)
+    data = water_data.get(user_id)
+    if not data or data.get("water_count", 0) <= 0:
+        return None
+    if guild_id is not None and data.get("guild_id") != guild_id:
+        return None
+
+    next_water = data.get("next_water")
+    if next_water is None or next_water <= now:
+        return None
+    return next_water
+
 async def send_harvest_notice(user_id: int, slot: int, channel: discord.TextChannel, mention: str):
     if user_id not in plant_data or slot not in plant_data[user_id]:
         return
@@ -263,7 +477,7 @@ async def send_harvest_notice(user_id: int, slot: int, channel: discord.TextChan
     harvest_embed.add_field(name="계절", value=f"{season_emoji(season)} {season}", inline=True)
     if season == "가을":
         harvest_embed.add_field(name="🍂 가을 보너스", value="2.5% 확률로 수확량 2배!", inline=False)
-    await channel.send(content=mention, embed=harvest_embed)
+    await safe_channel_send(channel, content=mention, embed=harvest_embed)
     cancel_plant(user_id, slot)
 
 def apply_season_to_plants(guild_id: int, season: str):
@@ -327,24 +541,123 @@ def change_guild_season(guild_id: int, season: str):
     apply_season_to_plants(guild_id, season)
     save_state()
 
+def change_all_guild_seasons(season: str) -> tuple[int, int]:
+    global default_season
+    default_season = season
+
+    target_guild_ids = {guild.id for guild in bot.guilds}
+    target_guild_ids.update(current_season.keys())
+
+    changed_count = 0
+    for guild_id in target_guild_ids:
+        if current_season.get(guild_id) != season:
+            changed_count += 1
+        current_season[guild_id] = season
+        apply_season_to_water(guild_id, season)
+        apply_season_to_plants(guild_id, season)
+
+    save_state()
+    return len(target_guild_ids), changed_count
+
+async def get_saved_channel(channel_id: int | None):
+    if not channel_id:
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is not None:
+        return channel
+    try:
+        return await bot.fetch_channel(channel_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+async def restore_running_tasks():
+    restored = 0
+    for user_id, slots in list(plant_data.items()):
+        for slot, data in list(slots.items()):
+            channel = await get_saved_channel(data.get("channel_id"))
+            mention = data.get("user_mention") or f"<@{user_id}>"
+            if channel is None:
+                slots.pop(slot, None)
+                continue
+            plant_tasks.setdefault(user_id, {})[slot] = bot.loop.create_task(
+                harvest_timer(user_id, slot, channel, mention)
+            )
+            restored += 1
+        if not slots:
+            plant_data.pop(user_id, None)
+
+    for user_id, data in list(water_data.items()):
+        channel = await get_saved_channel(data.get("channel_id"))
+        mention = data.get("user_mention") or f"<@{user_id}>"
+        if channel is None:
+            water_data.pop(user_id, None)
+            continue
+        water_tasks[user_id] = bot.loop.create_task(water_loop(user_id, channel, mention))
+        restored += 1
+
+    for user_id, data in list(pickle_data.items()):
+        channel = await get_saved_channel(data.get("channel_id"))
+        if channel is None:
+            pickle_data.pop(user_id, None)
+            continue
+        pickle_tasks[user_id] = bot.loop.create_task(process_timer_loop("pickle", user_id, channel))
+        restored += 1
+
+    for user_id, data in list(brew_data.items()):
+        channel = await get_saved_channel(data.get("channel_id"))
+        if channel is None:
+            brew_data.pop(user_id, None)
+            continue
+        brew_tasks[user_id] = bot.loop.create_task(process_timer_loop("brew", user_id, channel))
+        restored += 1
+
+    for user_id, data in list(trade_data.items()):
+        channel = await get_saved_channel(data.get("channel_id"))
+        if channel is None:
+            trade_data.pop(user_id, None)
+            continue
+        trade_tasks[user_id] = bot.loop.create_task(process_timer_loop("trade", user_id, channel))
+        restored += 1
+
+    save_state()
+    print(f"[restore] restored {restored} running timers")
+
 # ─────────────────────────────────────────
 # on_ready
 # ─────────────────────────────────────────
 @bot.event
 async def on_ready():
-    global season_task, state_loaded
+    global season_task, state_loaded, commands_synced
     if not state_loaded:
         load_state()
         state_loaded = True
+        await restore_running_tasks()
+
+    created_count = 0
+    for guild in bot.guilds:
+        if guild.id not in current_season:
+            ensure_guild_season(guild.id)
+            created_count += 1
 
     if season_task is None or season_task.done():
         season_task = bot.loop.create_task(season_tick())
 
-    synced = await bot.tree.sync()
+    synced = []
+    if not commands_synced:
+        synced = await bot.tree.sync()
+        commands_synced = True
     print(f"✅ {bot.user} 로그인 완료")
-    print(f"🌐 전역 동기화 — {len(synced)}개 커맨드")
-    for cmd in synced:
-        print(f"   └─ /{cmd.name}")
+    if created_count:
+        print(f"🗓️ 기본 계절 자동 설정 — {created_count}개 서버")
+    if synced:
+        print(f"🌐 전역 동기화 — {len(synced)}개 커맨드")
+        for cmd in synced:
+            print(f"   └─ /{cmd.name}")
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    season = ensure_guild_season(guild.id)
+    print(f"[on_guild_join] guild={guild.id} 기본 계절 자동 설정: {season}")
 
 
 # ─────────────────────────────────────────
@@ -362,11 +675,10 @@ async def season_tick():
         print(f"[season_tick] 다음 계절 변경까지 {wait_sec:.0f}초 대기 ({fmt_time(midnight)} KST)")
         await asyncio.sleep(wait_sec)
 
-        for guild_id in list(current_season.keys()):
-            prev = current_season[guild_id]
-            curr = next_season(prev)
-            change_guild_season(guild_id, curr)
-            print(f"[season_tick] guild={guild_id} 계절 변경: {prev} → {curr}")
+        prev = default_season
+        curr = next_season(prev)
+        total_guilds, changed_count = change_all_guild_seasons(curr)
+        print(f"[season_tick] 전체 계절 변경: {prev} → {curr} ({changed_count}/{total_guilds}개 서버 변경)")
 
 
 # ─────────────────────────────────────────
@@ -378,7 +690,7 @@ async def cmd_current_season(interaction: discord.Interaction):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
+            description="봇 소유자가 먼저 `!계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -393,51 +705,6 @@ async def cmd_current_season(interaction: discord.Interaction):
     crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(season, set())))
     embed.add_field(name=f"{season_emoji(season)} 제철 작물", value=crops_str, inline=False)
     embed.set_footer(text="매일 자정(KST) 자동으로 다음 계절로 넘어갑니다")
-    await interaction.response.send_message(embed=embed)
-
-
-# ─────────────────────────────────────────
-# /계절설정
-# ─────────────────────────────────────────
-@bot.tree.command(name="계절설정", description="이 서버의 계절을 설정합니다")
-@app_commands.default_permissions(administrator=True)
-@app_commands.choices(계절=[
-    app_commands.Choice(name="봄", value="봄"),
-    app_commands.Choice(name="여름", value="여름"),
-    app_commands.Choice(name="가을", value="가을"),
-    app_commands.Choice(name="겨울", value="겨울"),
-])
-async def cmd_set_season_slash(interaction: discord.Interaction, 계절: app_commands.Choice[str]):
-    if interaction.guild_id is None:
-        await interaction.response.send_message("❌ 서버 채널에서만 사용할 수 있습니다.", ephemeral=True)
-        return
-
-    permissions = getattr(interaction.user, "guild_permissions", None)
-    if not permissions or not permissions.administrator:
-        await interaction.response.send_message("❌ 이 명령어는 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
-
-    prev_season = current_season.get(interaction.guild_id)
-    season = 계절.value
-    change_guild_season(interaction.guild_id, season)
-
-    new_water_min = SUMMER_WATER_MINUTES if season == "여름" else BASE_WATER_MINUTES
-    nxt = next_season(season)
-    embed = discord.Embed(
-        title="✅ 이 서버 계절 설정 완료",
-        color={"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}.get(season, 0x57F287)
-    )
-    embed.add_field(name="현재 계절", value=f"{season_emoji(season)} **{season}**", inline=True)
-    embed.add_field(name="다음 계절", value=f"{season_emoji(nxt)} **{nxt}**", inline=True)
-    crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(season, set())))
-    embed.add_field(name=f"{season_emoji(season)} 제철 작물", value=crops_str, inline=False)
-    if prev_season and prev_season != season:
-        embed.add_field(
-            name="💧 물주기 간격 변경",
-            value=f"이 서버에서 진행 중인 물주기 간격이 **{new_water_min}분**으로 자동 변경되었습니다.",
-            inline=False
-        )
-    embed.set_footer(text="이 설정은 현재 서버에만 적용됩니다")
     await interaction.response.send_message(embed=embed)
 
 
@@ -462,27 +729,61 @@ async def cmd_set_season(ctx: commands.Context, 계절: str = ""):
         await ctx.send("❌ 계절은 `봄`, `여름`, `가을`, `겨울` 중 하나로 입력해주세요. 예: `!계절설정 봄`")
         return
 
-    prev_season = current_season.get(ctx.guild.id)
-    change_guild_season(ctx.guild.id, 계절)
+    total_guilds, changed_count = change_all_guild_seasons(계절)
 
     new_water_min = SUMMER_WATER_MINUTES if 계절 == "여름" else BASE_WATER_MINUTES
 
     nxt = next_season(계절)
     embed = discord.Embed(
-        title="✅ 이 서버 계절 설정 완료",
+        title="✅ 전체 서버 계절 설정 완료",
         color={"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}.get(계절, 0x57F287)
     )
-    embed.add_field(name="현재 계절", value=f"{season_emoji(계절)} **{계절}**", inline=True)
+    embed.add_field(name="기본/현재 계절", value=f"{season_emoji(계절)} **{계절}**", inline=True)
     embed.add_field(name="다음 계절", value=f"{season_emoji(nxt)} **{nxt}**", inline=True)
+    embed.add_field(name="적용 서버", value=f"`{total_guilds}`개 서버 중 `{changed_count}`개 변경", inline=True)
     crops_str = "  ".join(f"`{c}`" for c in sorted(SEASON_CROPS.get(계절, set())))
     embed.add_field(name=f"{season_emoji(계절)} 제철 작물", value=crops_str, inline=False)
-    if prev_season and prev_season != 계절:
-        embed.add_field(
-            name="💧 물주기 간격 변경",
-            value=f"진행 중인 물주기 간격이 **{new_water_min}분**으로 자동 변경되었습니다.",
-            inline=False
+    embed.add_field(
+        name="💧 물주기 간격",
+        value=f"진행 중인 모든 서버의 물주기 간격이 **{new_water_min}분** 기준으로 자동 반영되었습니다.",
+        inline=False
+    )
+    embed.set_footer(text="이 설정은 모든 서버와 새로 들어오는 서버에 적용됩니다 · 매일 자정(KST)에 자동으로 다음 계절로 넘어갑니다")
+    await ctx.send(embed=embed)
+
+
+# ─────────────────────────────────────────
+# !데이터초기화 (봇 소유자 전용, 계절 제외)
+# ─────────────────────────────────────────
+@bot.command(name="데이터초기화", hidden=True)
+async def cmd_reset_data(ctx: commands.Context, 확인: str = ""):
+    if OWNER_ID == 0:
+        await ctx.send("❌ `.env`에 `OWNER_ID=디스코드_유저_ID`를 먼저 설정해주세요.")
+        return
+
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ 이 명령어는 봇 소유자만 사용할 수 있습니다.")
+        return
+
+    if 확인 != "확인":
+        await ctx.send(
+            "⚠️ 계절 정보만 남기고 심기/물주기/절임통/양조통/무역 데이터를 초기화합니다.\n"
+            "정말 실행하려면 `!데이터초기화 확인`을 입력해주세요."
         )
-    embed.set_footer(text="이 설정은 현재 서버에만 적용됩니다 · 매일 자정(KST)에 자동으로 다음 계절로 넘어갑니다")
+        return
+
+    counts = reset_non_season_state()
+    embed = discord.Embed(
+        title="✅ JSON 데이터 초기화 완료",
+        description="계절 정보는 유지했고, 진행 중이던 타이머 데이터만 초기화했습니다.",
+        color=0x57F287
+    )
+    embed.add_field(name="🌱 심기", value=f"`{counts['plant']}`개", inline=True)
+    embed.add_field(name="💧 물주기", value=f"`{counts['water']}`개", inline=True)
+    embed.add_field(name="🫙 절임통", value=f"`{counts['pickle']}`개", inline=True)
+    embed.add_field(name="🍺 양조통", value=f"`{counts['brew']}`개", inline=True)
+    embed.add_field(name="🚢 무역", value=f"`{counts['trade']}`개", inline=True)
+    embed.add_field(name="보존됨", value=f"기본 계절 `{default_season}`, 서버별 계절 `{len(current_season)}`개", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -499,7 +800,6 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="⛔ /물주기취소",          value="진행 중인 물주기 중단",                                    inline=False)
     embed.add_field(name="🌾 /작물목록",            value="모든 작물과 성장 정보 보기",                               inline=False)
     embed.add_field(name="🗓️ /현재계절",           value="현재 서버 계절 확인",                                      inline=False)
-    embed.add_field(name="🗓️ /계절설정 [계절]",     value="현재 서버 계절 설정 (서버 관리자)",                         inline=False)
     embed.add_field(name="─────────────────", value="🫙 **가공 알림**", inline=False)
     embed.add_field(name="🫙 /절임통",             value="절임통 타이머 시작 (인게임 3일 = 144분)",                   inline=False)
     embed.add_field(name="⛔ /절임통취소",          value="진행 중인 절임통 타이머 취소",                             inline=False)
@@ -525,10 +825,10 @@ async def cmd_croplist(interaction: discord.Interaction):
     DAY_ICON     = {1: "⚡", 2: "🌿", 3: "🌳", 4: "🏔️", 5: "💎"}
     SEASON_COLOR = {"봄": 0xFFB7C5, "여름": 0xFFD700, "가을": 0xFF8C00, "겨울": 0x87CEEB}
     SEASON_DESC  = {
-        "봄":  "🌸 봄 작물 — 성장속도 ×0.8 (빠름!)",
+        "봄":  "🌸 봄 작물 — 성장속도 +20%",
         "여름": "☀️ 여름 작물 — 물주기 간격 24분 (절반!)",
         "가을": "🍂 가을 작물 — 2.5% 확률 수확량 2배!",
-        "겨울": "❄️ 겨울 작물 — 성장속도 ×1.5 (느림)",
+        "겨울": "❄️ 겨울 작물 — 성장속도 -50%",
     }
 
     embeds = []
@@ -589,7 +889,7 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     if not season:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
+            description="봇 소유자가 먼저 `!계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -624,6 +924,7 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     crop_season = CROP_SEASON.get(작물, "알 수 없음")
     crop_sem    = season_emoji(crop_season)
 
+    wet_soil_deadline = get_wet_soil_deadline(user_id, interaction.guild_id, now)
     plant_data.setdefault(user_id, {})[slot] = {
         "crop": 작물, "season": season, "growth_min": growth_min,
         "water_min": water_min, "in_season": in_season,
@@ -639,6 +940,12 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
         "channel_id": interaction.channel_id,
         "guild_id": interaction.guild_id,
     }
+    if wet_soil_deadline is not None:
+        pdata = plant_data[user_id][slot]
+        pdata["last_water_click"] = now
+        pdata["growth_started_at"] = now
+        pdata["current_deadline"] = wet_soil_deadline
+        pdata["growth_warn_sent"] = False
 
     bonus_text = (
         "✅ 제철! 성장속도 +50% 보너스"
@@ -661,6 +968,13 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     embed.add_field(name="제철 여부",      value=bonus_text,                      inline=False)
     embed.add_field(name="필요 성장 시간", value=f"⏱ `{growth_min}분`", inline=True)
     embed.add_field(name="내 심기 현황",   value=slot_status,                     inline=False)
+    if wet_soil_deadline is not None:
+        wet_remain_min = max(round((wet_soil_deadline - now).total_seconds() / 60, 1), 0)
+        embed.add_field(
+            name="💧 젖은 땅 적용",
+            value=f"이미 물이 있어서 `{fmt_time(wet_soil_deadline)}`까지 (`{wet_remain_min}분`) 바로 성장합니다.",
+            inline=False
+        )
     embed.add_field(
         name="⏱️ 수확 조건",
         value="물주기 ✅를 누른 뒤 다음 물주기 시간까지 성장합니다. 물을 안 주면 성장이 멈춥니다.",
@@ -671,6 +985,7 @@ async def cmd_plant(interaction: discord.Interaction, 작물: str):
     embed.set_footer(text=f"심기 슬롯 {slot}/{MAX_SLOTS} | 물을 준 동안만 성장합니다!")
 
     await interaction.response.send_message(content=interaction.user.mention, embed=embed)
+    save_state()
     plant_tasks.setdefault(user_id, {})[slot] = bot.loop.create_task(
         harvest_timer(user_id, slot, interaction.channel, interaction.user.mention)
     )
@@ -706,7 +1021,7 @@ async def harvest_timer(user_id: int, slot: int, channel: discord.TextChannel, m
                 continue
 
             if remain_sec <= 60 and not data.get("growth_warn_sent"):
-                await channel.send(embed=discord.Embed(
+                await safe_channel_send(channel, embed=discord.Embed(
                     title=f"🔔 {slot_emoji(slot)} 슬롯{slot} — {crop} 재배 완료 1분 전!",
                     description=f"{mention} **{crop}** 재배 시간이 **1분 후** 완료됩니다.",
                     color=0xFEE75C
@@ -745,7 +1060,7 @@ async def cmd_water(interaction: discord.Interaction):
     if not season:
         await interaction.followup.send(embed=discord.Embed(
             title="❌ 계절 미설정",
-            description="서버 관리자가 먼저 `/계절설정`으로 계절을 설정해야 합니다.",
+            description="봇 소유자가 먼저 `!계절설정`으로 계절을 설정해야 합니다.",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -785,6 +1100,7 @@ async def cmd_water(interaction: discord.Interaction):
     embed.set_footer(text="지금 바로 ✅ 반응 클릭해서 첫 물주기!")
 
     await interaction.followup.send(embed=embed)
+    save_state()
     water_tasks[user_id] = bot.loop.create_task(
         water_loop(user_id, interaction.channel, interaction.user.mention)
     )
@@ -823,7 +1139,7 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                 if data.get("timer_version", 0) != version:
                     continue
 
-                await channel.send(embed=discord.Embed(
+                await safe_channel_send(channel, embed=discord.Embed(
                     title="🔔 물주기 1분 전!",
                     description=(
                         f"{mention} 물주기 **1분 전**! 준비하세요 💧\n"
@@ -860,7 +1176,7 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             water_embed.add_field(name="물주기 간격", value=f"⏱ `{water_min}분`마다",       inline=True)
             water_embed.add_field(name="현재 계절",   value=f"{season_emoji(season)} {season}", inline=True)
 
-            water_msg = await channel.send(embed=water_embed)
+            water_msg = await safe_channel_send(channel, embed=water_embed)
             await water_msg.add_reaction("✅")
 
             def check(reaction, user):
@@ -878,7 +1194,7 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                 )
             except asyncio.TimeoutError:
                 if user_id in water_data:
-                    await channel.send(embed=discord.Embed(
+                    await safe_channel_send(channel, embed=discord.Embed(
                         title="⚠️ 물주기 미완료",
                         description=(
                             f"{mention} 물주기를 놓쳤어요!\n"
@@ -910,7 +1226,7 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                     commit_growth_progress(pdata, click_time)
                     pdata["last_water_click"] = click_time   # ← 타이머 트리거
                     pdata["growth_started_at"] = click_time
-                    pdata["current_deadline"] = click_time + timedelta(minutes=pdata["water_min"])
+                    pdata["current_deadline"] = next_water_time
                     pdata["growth_warn_sent"] = False
                     pdata["timer_version"]    = pdata.get("timer_version", 0) + 1
 
@@ -928,7 +1244,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                 inline=False
             )
             confirm.add_field(name="물주기 간격", value=f"⏱ `{water_min}분` ({season_emoji(season)} {season} 기준)", inline=True)
-            await channel.send(embed=confirm)
+            await safe_channel_send(channel, embed=confirm)
+            save_state()
 
             wait_sec = max(water_min - 1, 0) * 60
             slept = 0.0
@@ -950,7 +1267,7 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             if data.get("timer_version", 0) != version:
                 continue
 
-            await channel.send(embed=discord.Embed(
+            await safe_channel_send(channel, embed=discord.Embed(
                 title="🔔 물주기 1분 전!",
                 description=(
                     f"{mention} 물주기 **1분 전**! 준비하세요 💧\n"
@@ -984,13 +1301,14 @@ async def cmd_status(interaction: discord.Interaction):
     user_id = interaction.user.id
     p_slots = plant_data.get(user_id, {})
 
-    has_pickle = user_id in pickle_tasks and not pickle_tasks[user_id].done()
-    has_brew   = user_id in brew_tasks   and not brew_tasks[user_id].done()
+    has_pickle = user_id in pickle_data
+    has_brew   = user_id in brew_data
+    has_trade  = user_id in trade_data
 
-    if not p_slots and user_id not in water_data and not has_pickle and not has_brew:
+    if not p_slots and user_id not in water_data and not has_pickle and not has_brew and not has_trade:
         await interaction.response.send_message(embed=discord.Embed(
             title="❌ 진행 중인 항목 없음",
-            description="`/심기`, `/물주기`, `/절임통`, `/양조통`으로 시작하세요! 🌱",
+            description="`/심기`, `/물주기`, `/절임통`, `/양조통`, `/무역대기`로 시작하세요! 🌱",
             color=0xED4245
         ), ephemeral=True)
         return
@@ -1036,8 +1354,8 @@ async def cmd_status(interaction: discord.Interaction):
     # ── 물주기 요약 ──
     if user_id in water_data:
         d          = water_data[user_id]
-        next_w     = d.get("next_water", now)
-        remain_min = max(round((next_w - now).total_seconds() / 60, 1), 0)
+        next_w     = d.get("next_water") or now
+        remain_min = timer_remaining_minutes(next_w, now)
         w_summary  = discord.Embed(title="💧 물주기 현황", color=0x5865F2)
         w_summary.add_field(name="누적 횟수",   value=f"💧 `{d['water_count']}회`",                  inline=True)
         w_summary.add_field(name="현재 계절",   value=f"{season_emoji(d['season'])} {d['season']}", inline=True)
@@ -1049,14 +1367,28 @@ async def cmd_status(interaction: discord.Interaction):
         )
         embeds.append(w_summary)
 
-    # ── 절임통 / 양조통 요약 ──
+    # ── 절임통 / 양조통 / 무역 요약 ──
     if has_pickle or has_brew:
         proc_embed = discord.Embed(title="🫙 가공 현황", color=0xA8D5A2)
         if has_pickle:
-            proc_embed.add_field(name="🫙 절임통", value="진행 중", inline=True)
+            finish = pickle_data[user_id].get("finish_time") or now
+            remain = timer_remaining_minutes(finish, now)
+            proc_embed.add_field(name="🫙 절임통", value=f"`{fmt_time(finish)}` 완료 예정\n약 `{remain}분` 후", inline=True)
         if has_brew:
-            proc_embed.add_field(name="🍺 양조통", value="진행 중", inline=True)
+            finish = brew_data[user_id].get("finish_time") or now
+            remain = timer_remaining_minutes(finish, now)
+            proc_embed.add_field(name="🍺 양조통", value=f"`{fmt_time(finish)}` 완료 예정\n약 `{remain}분` 후", inline=True)
         embeds.append(proc_embed)
+
+    if has_trade:
+        d = trade_data[user_id]
+        finish = d.get("finish_time") or now
+        remain = timer_remaining_minutes(finish, now)
+        trade_summary = discord.Embed(title="🚢 무역 현황", color=0x5865F2)
+        trade_summary.add_field(name="알림 종류", value=d.get("done_title") or "무역 알림", inline=True)
+        trade_summary.add_field(name="예정 시각", value=f"`{fmt_time(finish)}`", inline=True)
+        trade_summary.add_field(name="남은 시간", value=f"약 `{remain}분`", inline=True)
+        embeds.append(trade_summary)
 
     await interaction.response.send_message(embeds=embeds)
 
@@ -1143,6 +1475,113 @@ async def cmd_cancel_water(interaction: discord.Interaction):
 # ─────────────────────────────────────────
 # 🫙 /절임통
 # ─────────────────────────────────────────
+PROCESS_TIMER_CONFIG = {
+    "pickle": {
+        "emoji": "\U0001fad9",
+        "name": "\uc808\uc784\ud1b5",
+        "warn": "\uc808\uc784\ud1b5\uc774 1\ubd84 \ud6c4 \uc644\ub8cc\ub429\ub2c8\ub2e4!",
+        "done": "\uc808\uc784\ud1b5\uc774 \uc644\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4! \uaebc\ub0b4\uc8fc\uc138\uc694.",
+    },
+    "brew": {
+        "emoji": "\U0001f37a",
+        "name": "\uc591\uc870\ud1b5",
+        "warn": "\uc591\uc870\ud1b5\uc774 1\ubd84 \ud6c4 \uc644\ub8cc\ub429\ub2c8\ub2e4!",
+        "done": "\uc591\uc870\ud1b5\uc774 \uc644\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4! \uaebc\ub0b4\uc8fc\uc138\uc694.",
+    },
+    "trade": {
+        "emoji": "\U0001f6a2",
+        "name": "\ubb34\uc5ed",
+        "warn": "\ubb34\uc5ed \uc54c\ub9bc\uc774 1\ubd84 \ud6c4\uc785\ub2c8\ub2e4!",
+        "done": "\ubb34\uc5ed \uc2dc\uac04\uc785\ub2c8\ub2e4!",
+    },
+}
+
+def get_process_timer_maps(kind: str) -> tuple[dict[int, dict], dict[int, asyncio.Task]]:
+    if kind == "pickle":
+        return pickle_data, pickle_tasks
+    if kind == "brew":
+        return brew_data, brew_tasks
+    if kind == "trade":
+        return trade_data, trade_tasks
+    raise ValueError(f"unknown process timer kind: {kind}")
+
+def start_process_timer(
+    kind: str,
+    user_id: int,
+    channel: discord.TextChannel,
+    channel_id: int | None,
+    mention: str,
+    start_time: datetime,
+    finish_time: datetime,
+    **extra_data,
+):
+    data_map, task_map = get_process_timer_maps(kind)
+    data_map[user_id] = {
+        "finish_time": finish_time,
+        "start": start_time,
+        "user_mention": mention,
+        "channel_id": channel_id,
+        "warn_sent": False,
+        **extra_data,
+    }
+    save_state()
+    task_map[user_id] = bot.loop.create_task(process_timer_loop(kind, user_id, channel))
+
+async def process_timer_loop(kind: str, user_id: int, channel: discord.TextChannel):
+    config = PROCESS_TIMER_CONFIG[kind]
+    data_map, task_map = get_process_timer_maps(kind)
+    try:
+        data = data_map.get(user_id)
+        if not data:
+            return
+
+        mention = data.get("user_mention") or f"<@{user_id}>"
+        finish_time = data.get("finish_time")
+        if finish_time is None:
+            data_map.pop(user_id, None)
+            save_state()
+            return
+
+        warn_time = finish_time - timedelta(minutes=1)
+        now = datetime.now(KST)
+        if not data.get("warn_sent") and warn_time > now:
+            await asyncio.sleep((warn_time - now).total_seconds())
+
+        if user_id not in data_map:
+            return
+
+        data = data_map[user_id]
+        now = datetime.now(KST)
+        if not data.get("warn_sent") and finish_time > now:
+            await safe_channel_send(channel, embed=discord.Embed(
+                title=f"\U0001f514 {config['name']} 1\ubd84 \uc804",
+                description=f"{mention} {data.get('warn_text') or config['warn']}",
+                color=0xFEE75C
+            ))
+            data["warn_sent"] = True
+            save_state()
+            await asyncio.sleep(max((finish_time - datetime.now(KST)).total_seconds(), 0))
+
+        if user_id not in data_map:
+            return
+
+        now_done = datetime.now(KST)
+        done_title = data.get("done_title") or f"{config['name']} 완료"
+        await safe_channel_send(channel, content=mention, embed=discord.Embed(
+            title=f"{config['emoji']} {done_title}",
+            description=f"{mention} {data.get('done_text') or config['done']}\n\u23f0 `{fmt_time(now_done)}`",
+            color=0x57F287
+        ))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[process_timer_loop] error (kind={kind}, user={user_id}): {e}")
+    finally:
+        task_map.pop(user_id, None)
+        if user_id in data_map:
+            data_map.pop(user_id, None)
+            save_state()
+
 @bot.tree.command(name="절임통", description="절임통 타이머를 시작합니다 (인게임 3일 = 144분)")
 async def cmd_pickle(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -1166,30 +1605,7 @@ async def cmd_pickle(interaction: discord.Interaction):
     embed.add_field(name="소요 시간", value=f"⏱ `{PICKLE_MINUTES}분` (인게임 3일)", inline=True)
     embed.set_footer(text="완료 1분 전에도 미리 알려드립니다!")
     await interaction.response.send_message(content=mention, embed=embed)
-
-    async def _timer():
-        try:
-            await asyncio.sleep((PICKLE_MINUTES - 1) * 60)
-            await channel.send(embed=discord.Embed(
-                title="🔔 절임통 완료 1분 전!",
-                description=f"{mention} 절임통이 **1분 후** 완료됩니다! 준비하세요 🫙",
-                color=0xFEE75C
-            ))
-            await asyncio.sleep(60)
-            now_done = datetime.now(KST)
-            await channel.send(content=mention, embed=discord.Embed(
-                title="🫙 절임통 완료!",
-                description=f"{mention} 절임통이 완료되었습니다! 꺼내주세요 🫙\n⏰ `{fmt_time(now_done)}`",
-                color=0x57F287
-            ))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[절임통] 오류 (user={user_id}): {e}")
-        finally:
-            pickle_tasks.pop(user_id, None)
-
-    pickle_tasks[user_id] = bot.loop.create_task(_timer())
+    start_process_timer("pickle", user_id, channel, interaction.channel_id, mention, now, finish_time)
 
 
 # ─────────────────────────────────────────
@@ -1241,30 +1657,7 @@ async def cmd_brew(interaction: discord.Interaction):
     embed.add_field(name="소요 시간", value=f"⏱ `{BREW_MINUTES}분` (인게임 5일)", inline=True)
     embed.set_footer(text="완료 1분 전에도 미리 알려드립니다!")
     await interaction.response.send_message(content=mention, embed=embed)
-
-    async def _timer():
-        try:
-            await asyncio.sleep((BREW_MINUTES - 1) * 60)
-            await channel.send(embed=discord.Embed(
-                title="🔔 양조통 완료 1분 전!",
-                description=f"{mention} 양조통이 **1분 후** 완료됩니다! 준비하세요 🍺",
-                color=0xFEE75C
-            ))
-            await asyncio.sleep(60)
-            now_done = datetime.now(KST)
-            await channel.send(content=mention, embed=discord.Embed(
-                title="🍺 양조통 완료!",
-                description=f"{mention} 양조통이 완료되었습니다! 꺼내주세요 🍺\n⏰ `{fmt_time(now_done)}`",
-                color=0x57F287
-            ))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[양조통] 오류 (user={user_id}): {e}")
-        finally:
-            brew_tasks.pop(user_id, None)
-
-    brew_tasks[user_id] = bot.loop.create_task(_timer())
+    start_process_timer("brew", user_id, channel, interaction.channel_id, mention, now, finish_time)
 
 
 # ─────────────────────────────────────────
@@ -1316,30 +1709,18 @@ async def cmd_trade_wait(interaction: discord.Interaction):
     embed.add_field(name="소요 시간", value="⏱ `60분`",                      inline=True)
     embed.set_footer(text="물품 넣기 1분 전에도 미리 알려드립니다!")
     await interaction.response.send_message(content=mention, embed=embed)
-
-    async def _timer():
-        try:
-            await asyncio.sleep(59 * 60)
-            await channel.send(embed=discord.Embed(
-                title="🔔 무역 물품 넣기 1분 전!",
-                description=f"{mention} 무역 물품 넣기가 **1분 후**입니다! 준비하세요 🚢",
-                color=0xFEE75C
-            ))
-            await asyncio.sleep(60)
-            now_done = datetime.now(KST)
-            await channel.send(content=mention, embed=discord.Embed(
-                title="🚢 무역 물품 넣기!",
-                description=f"{mention} 무역 물품을 넣어주세요!\n⏰ `{fmt_time(now_done)}`",
-                color=0x57F287
-            ))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[무역대기] 오류 (user={user_id}): {e}")
-        finally:
-            trade_tasks.pop(user_id, None)
-
-    trade_tasks[user_id] = bot.loop.create_task(_timer())
+    start_process_timer(
+        "trade",
+        user_id,
+        channel,
+        interaction.channel_id,
+        mention,
+        now,
+        finish_time,
+        warn_text="\ubb34\uc5ed \ubb3c\ud488 \ub123\uae30\uac00 1\ubd84 \ud6c4\uc785\ub2c8\ub2e4!",
+        done_title="\ubb34\uc5ed \ubb3c\ud488 \ub123\uae30",
+        done_text="\ubb34\uc5ed \ubb3c\ud488\uc744 \ub123\uc5b4\uc8fc\uc138\uc694!",
+    )
 
 
 # ─────────────────────────────────────────
@@ -1394,31 +1775,18 @@ async def cmd_trade_end(interaction: discord.Interaction, 시간: str):
         embed.set_footer(text="완료 1분 전에도 미리 알려드립니다!")
     await interaction.response.send_message(content=mention, embed=embed)
 
-    async def _timer():
-        try:
-            warn_sec = max((total_min - 1) * 60, 0)
-            await asyncio.sleep(warn_sec)
-            if total_min > 1:
-                await channel.send(embed=discord.Embed(
-                    title="🔔 무역 완료 1분 전!",
-                    description=f"{mention} 무역이 **1분 후** 완료됩니다! 준비하세요 🚢",
-                    color=0xFEE75C
-                ))
-                await asyncio.sleep(60)
-            now_done = datetime.now(KST)
-            await channel.send(content=mention, embed=discord.Embed(
-                title="🚢 무역 완료!",
-                description=f"{mention} **{total_min}분** 무역이 완료되었습니다!\n⏰ `{fmt_time(now_done)}`",
-                color=0x57F287
-            ))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[무역종료] 오류 (user={user_id}): {e}")
-        finally:
-            trade_tasks.pop(user_id, None)
-
-    trade_tasks[user_id] = bot.loop.create_task(_timer())
+    start_process_timer(
+        "trade",
+        user_id,
+        channel,
+        interaction.channel_id,
+        mention,
+        now,
+        finish_time,
+        warn_text="\ubb34\uc5ed\uc774 1\ubd84 \ud6c4 \uc644\ub8cc\ub429\ub2c8\ub2e4! \uc900\ube44\ud558\uc138\uc694.",
+        done_title="\ubb34\uc5ed \uc644\ub8cc",
+        done_text=f"**{total_min}\ubd84** \ubb34\uc5ed\uc774 \uc644\ub8cc\ub418\uc5c8\uc2b5\ub2c8\ub2e4!",
+    )
 
 
 # ─────────────────────────────────────────
@@ -1446,29 +1814,18 @@ async def cmd_trade_give_up(interaction: discord.Interaction):
     embed.set_footer(text="재확인 1분 전에도 미리 알려드립니다!")
     await interaction.response.send_message(content=mention, embed=embed)
 
-    async def _timer():
-        try:
-            await asyncio.sleep(179 * 60)
-            await channel.send(embed=discord.Embed(
-                title="🔔 무역 재확인 1분 전!",
-                description=f"{mention} 무역 재확인까지 **1분** 남았습니다! 🚢",
-                color=0xFEE75C
-            ))
-            await asyncio.sleep(60)
-            now_done = datetime.now(KST)
-            await channel.send(content=mention, embed=discord.Embed(
-                title="🚢 무역 확인 시간!",
-                description=f"{mention} 무역을 다시 확인해보세요!\n⏰ `{fmt_time(now_done)}`",
-                color=0xFFD700
-            ))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[무역포기] 오류 (user={user_id}): {e}")
-        finally:
-            trade_tasks.pop(user_id, None)
-
-    trade_tasks[user_id] = bot.loop.create_task(_timer())
+    start_process_timer(
+        "trade",
+        user_id,
+        channel,
+        interaction.channel_id,
+        mention,
+        now,
+        remind_time,
+        warn_text="\ubb34\uc5ed \uc7ac\ud655\uc778\uae4c\uc9c0 1\ubd84 \ub0a8\uc558\uc2b5\ub2c8\ub2e4!",
+        done_title="\ubb34\uc5ed \ud655\uc778 \uc2dc\uac04",
+        done_text="\ubb34\uc5ed\uc744 \ub2e4\uc2dc \ud655\uc778\ud574\ubcf4\uc138\uc694!",
+    )
 
 
 # ─────────────────────────────────────────
