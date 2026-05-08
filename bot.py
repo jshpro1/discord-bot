@@ -125,7 +125,9 @@ BREW_MINUTES   = 240   # 인게임 5일
 # ─────────────────────────────────────────
 current_season: dict[int, str] = {}
 default_season = "가을"
+last_season_change_at = datetime.now(KST)
 season_task: asyncio.Task | None = None
+state_save_task: asyncio.Task | None = None
 state_loaded = False
 last_saved_sections: dict[str, str] = {}
 save_retry_sections: dict[str, str] | None = None
@@ -199,7 +201,7 @@ def parse_state_datetime(value):
 def decode_state_datetimes(data: dict) -> dict:
     dt_fields = {
         "start", "end", "last_water_click", "growth_started_at",
-        "current_deadline", "next_water", "finish_time",
+        "current_deadline", "next_water", "finish_time", "last_season_change_at",
     }
     decoded = dict(data)
     for field in dt_fields:
@@ -232,6 +234,7 @@ def decode_timer_dict(raw: dict | None, *, nested_slots: bool = False) -> dict:
 def build_state_dict() -> dict:
     return {
         "default_season": default_season,
+        "last_season_change_at": encode_state_value(last_season_change_at),
         "current_season": {str(gid): season for gid, season in current_season.items()},
         "plant_data": encode_state_value(plant_data),
         "water_data": encode_state_value(water_data),
@@ -446,6 +449,21 @@ def ensure_state_db(conn: sqlite3.Connection):
 def state_backend_target() -> str:
     return state_backend.target_description()
 
+def state_backend_log_target() -> str:
+    try:
+        return state_backend_target()
+    except Exception:
+        return STATE_DB_FILE
+
+def ensure_state_save_worker():
+    global state_save_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if state_save_task is None or state_save_task.done():
+        state_save_task = loop.create_task(retry_pending_state_saves())
+
 def log_state_backend_startup():
     try:
         target = state_backend_target()
@@ -461,35 +479,60 @@ def log_state_backend_startup():
         print(f"[state_backend] startup check failed: {e}")
 
 def save_state():
-    global last_saved_sections, save_retry_sections, save_retry_not_before, save_error_log_not_before
+    global save_retry_sections, save_retry_not_before
     sections = build_state_sections()
-    now_monotonic = time.monotonic()
     if sections == last_saved_sections and state_backend.has_storage():
         return
-    if now_monotonic < save_retry_not_before:
-        save_retry_sections = sections
+    save_retry_sections = sections
+    save_retry_not_before = 0.0
+    ensure_state_save_worker()
+
+def persist_loaded_state_to_backend(source_path: str | None):
+    global save_retry_sections, save_retry_not_before
+    if not source_path or source_path == state_backend_target():
         return
-    try:
-        state_backend.save_sections(sections, last_saved_sections)
-        last_saved_sections = sections
-        save_retry_sections = None
-        save_retry_not_before = 0.0
-        save_error_log_not_before = 0.0
-    except (OSError, sqlite3.Error) as e:
-        if is_no_space_error(e):
-            save_retry_sections = sections
-            save_retry_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
-            if now_monotonic >= save_error_log_not_before:
-                print(
-                    f"[save_state] 저장 보류: 디스크 공간 부족으로 {SAVE_RETRY_COOLDOWN_SECONDS:.0f}초 뒤 재시도합니다. "
-                    f"(경로: {STATE_DB_FILE}, 섹션 수: {len(sections)})"
-                )
-                print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
-                save_error_log_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
-            return
-        print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
-    except Exception as e:
-        print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
+
+    sections = build_state_sections()
+    save_retry_sections = sections
+    save_retry_not_before = 0.0
+    print(f"[state_backend] queued loaded state migration from {source_path} to {state_backend_target()}")
+
+async def retry_pending_state_saves():
+    global last_saved_sections, save_retry_sections, save_retry_not_before, save_error_log_not_before
+    while True:
+        await asyncio.sleep(1)
+        if save_retry_sections is None:
+            continue
+        if time.monotonic() < save_retry_not_before:
+            continue
+
+        sections = save_retry_sections
+        previous_sections = last_saved_sections
+        now_monotonic = time.monotonic()
+
+        try:
+            await asyncio.to_thread(state_backend.save_sections, sections, previous_sections)
+            last_saved_sections = sections
+            if save_retry_sections == sections:
+                save_retry_sections = None
+            save_retry_not_before = 0.0
+            save_error_log_not_before = 0.0
+        except (OSError, sqlite3.Error) as e:
+            if is_no_space_error(e):
+                save_retry_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
+                if now_monotonic >= save_error_log_not_before:
+                    print(
+                        f"[save_state] 저장 보류: 디스크 공간 부족으로 {SAVE_RETRY_COOLDOWN_SECONDS:.0f}초 뒤 재시도합니다. "
+                        f"(경로: {state_backend_log_target()}, 섹션 수: {len(sections)})"
+                    )
+                    print(f"[save_state] 오류: {e} (경로: {state_backend_log_target()})")
+                    save_error_log_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
+                continue
+            save_retry_not_before = now_monotonic + 5.0
+            print(f"[save_state] 오류: {e} (경로: {state_backend_log_target()})")
+        except Exception as e:
+            save_retry_not_before = now_monotonic + 5.0
+            print(f"[save_state] 오류: {e} (경로: {state_backend_log_target()})")
 
 def load_state_legacy_direct():
     global default_season, last_saved_sections
@@ -553,11 +596,12 @@ def load_state_legacy_direct():
         trade_data.update(decode_timer_dict(state.get("trade_data")))
         last_saved_sections = build_state_sections()
         print(f"[load_state] loaded from {loaded_path}")
+        persist_loaded_state_to_backend(loaded_path)
     except Exception as e:
         print(f"[load_state] 상태 적용 오류: {e} (경로: {loaded_path})")
 
 def load_state():
-    global default_season, last_saved_sections
+    global default_season, last_saved_sections, last_season_change_at
     state = None
     loaded_path = None
 
@@ -582,6 +626,9 @@ def load_state():
         )
         if loaded_default in SEASON_ORDER:
             default_season = loaded_default
+        loaded_last_season_change_at = parse_state_datetime(state.get("last_season_change_at"))
+        if loaded_last_season_change_at is not None:
+            last_season_change_at = loaded_last_season_change_at
 
         loaded_current_season = {
             int(gid): season
@@ -866,8 +913,9 @@ def change_guild_season(guild_id: int, season: str):
     save_state()
 
 def change_all_guild_seasons(season: str) -> tuple[int, int]:
-    global default_season
+    global default_season, last_season_change_at
     default_season = season
+    last_season_change_at = datetime.now(KST)
 
     target_guild_ids = {guild.id for guild in bot.guilds}
     target_guild_ids.update(current_season.keys())
@@ -882,6 +930,25 @@ def change_all_guild_seasons(season: str) -> tuple[int, int]:
 
     save_state()
     return len(target_guild_ids), changed_count
+
+def reconcile_season_schedule() -> tuple[str, str, int]:
+    global default_season, last_season_change_at
+    now = datetime.now(KST)
+    prev = default_season
+    days_passed = max((now.date() - last_season_change_at.date()).days, 0)
+    if days_passed <= 0:
+        return prev, default_season, 0
+
+    curr = default_season
+    for _ in range(days_passed):
+        curr = next_season(curr)
+
+    if curr != prev:
+        change_all_guild_seasons(curr)
+    else:
+        last_season_change_at = now
+        save_state()
+    return prev, curr, days_passed
 
 async def get_saved_channel(channel_id: int | None):
     if not channel_id:
@@ -955,10 +1022,13 @@ async def restore_running_tasks():
 # ─────────────────────────────────────────
 @bot.event
 async def on_ready():
-    global season_task, state_loaded, commands_synced
+    global season_task, state_save_task, state_loaded, commands_synced
     if not state_loaded:
         log_state_backend_startup()
         load_state()
+        prev_season, curr_season, days_passed = reconcile_season_schedule()
+        if days_passed > 0:
+            print(f"[season_reconcile] startup catch-up: {prev_season} -> {curr_season} ({days_passed}일 보정)")
         state_loaded = True
         await restore_running_tasks()
 
@@ -970,6 +1040,8 @@ async def on_ready():
 
     if season_task is None or season_task.done():
         season_task = bot.loop.create_task(season_tick())
+    if state_save_task is None or state_save_task.done():
+        state_save_task = bot.loop.create_task(retry_pending_state_saves())
 
     synced = []
     if not commands_synced:
