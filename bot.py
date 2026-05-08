@@ -3,9 +3,16 @@ from discord import app_commands
 from discord.ext import commands
 import os
 import json
+import sqlite3
+import traceback
 from dotenv import load_dotenv
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 KST = timezone(timedelta(hours=9))
 
@@ -18,6 +25,9 @@ except ValueError:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.getenv("STATE_FILE") or os.path.join(BASE_DIR, "wispbyte_state.json")
 STATE_BACKUP_FILE = f"{STATE_FILE}.bak"
+STATE_DB_FILE = os.getenv("STATE_DB_FILE") or os.path.splitext(STATE_FILE)[0] + ".db"
+STATE_BACKEND_NAME = (os.getenv("STATE_BACKEND") or "sqlite").strip().lower()
+POSTGRES_DSN = os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL") or ""
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -117,6 +127,11 @@ current_season: dict[int, str] = {}
 default_season = "가을"
 season_task: asyncio.Task | None = None
 state_loaded = False
+last_saved_sections: dict[str, str] = {}
+save_retry_sections: dict[str, str] | None = None
+save_retry_not_before = 0.0
+save_error_log_not_before = 0.0
+SAVE_RETRY_COOLDOWN_SECONDS = 60.0
 
 def get_season(guild_id: int | None, *, auto_create: bool = True) -> str | None:
     if guild_id is None:
@@ -214,8 +229,8 @@ def decode_timer_dict(raw: dict | None, *, nested_slots: bool = False) -> dict:
 
     return decoded
 
-def save_state():
-    state = {
+def build_state_dict() -> dict:
+    return {
         "default_season": default_season,
         "current_season": {str(gid): season for gid, season in current_season.items()},
         "plant_data": encode_state_value(plant_data),
@@ -224,34 +239,287 @@ def save_state():
         "brew_data": encode_state_value(brew_data),
         "trade_data": encode_state_value(trade_data),
     }
-    payload = json.dumps(state, ensure_ascii=False, indent=2)
-    tmp_file = f"{STATE_FILE}.tmp"
-    try:
-        state_dir = os.path.dirname(STATE_FILE)
+
+def build_state_payload() -> str:
+    return json.dumps(build_state_dict(), ensure_ascii=False, separators=(",", ":"))
+
+def build_state_sections() -> dict[str, str]:
+    state = build_state_dict()
+    return {
+        key: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        for key, value in state.items()
+    }
+
+def is_no_space_error(error: Exception) -> bool:
+    if getattr(error, "errno", None) == 28:
+        return True
+    message = str(error).lower()
+    return "database or disk is full" in message or "no space left on device" in message
+
+class StateBackend:
+    label = "state-backend"
+
+    def load_state_dict(self) -> dict | None:
+        raise NotImplementedError
+
+    def save_sections(self, sections: dict[str, str], previous_sections: dict[str, str]):
+        raise NotImplementedError
+
+    def has_storage(self) -> bool:
+        return True
+
+    def target_description(self) -> str:
+        return self.label
+
+    def startup_check(self) -> str:
+        return "ready"
+
+
+class SQLiteStateBackend(StateBackend):
+    label = "sqlite"
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def ensure_schema(self, conn: sqlite3.Connection):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS state_sections (
+                name TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+
+    def has_storage(self) -> bool:
+        return os.path.exists(self.db_path)
+
+    def target_description(self) -> str:
+        return self.db_path
+
+    def startup_check(self) -> str:
+        return "ready"
+
+    def load_state_dict(self) -> dict | None:
+        if not os.path.exists(self.db_path):
+            return None
+
+        with sqlite3.connect(self.db_path) as conn:
+            self.ensure_schema(conn)
+            rows = conn.execute("SELECT name, payload FROM state_sections").fetchall()
+        if not rows:
+            return None
+        return {name: json.loads(payload) for name, payload in rows}
+
+    def save_sections(self, sections: dict[str, str], previous_sections: dict[str, str]):
+        changed_sections = {
+            name: payload
+            for name, payload in sections.items()
+            if previous_sections.get(name) != payload
+        }
+        if not changed_sections and os.path.exists(self.db_path):
+            return
+
+        state_dir = os.path.dirname(self.db_path)
         if state_dir:
             os.makedirs(state_dir, exist_ok=True)
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            f.write(payload)
-        if os.path.exists(STATE_FILE):
-            os.replace(STATE_FILE, STATE_BACKUP_FILE)
-        os.replace(tmp_file, STATE_FILE)
-    except Exception as e:
-        print(f"[save_state] 오류: {e} (경로: {STATE_FILE}, 크기: {len(payload)} bytes)")
 
-def load_state():
-    global default_season
+        with sqlite3.connect(self.db_path) as conn:
+            self.ensure_schema(conn)
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("BEGIN")
+            for name, payload in changed_sections.items():
+                conn.execute(
+                    """
+                    INSERT INTO state_sections(name, payload)
+                    VALUES(?, ?)
+                    ON CONFLICT(name) DO UPDATE SET payload = excluded.payload
+                    """,
+                    (name, payload),
+                )
+            conn.commit()
+
+
+class PostgresStateBackend(StateBackend):
+    label = "postgres"
+
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+
+    def connect(self):
+        if psycopg is None:
+            raise RuntimeError(
+                "STATE_BACKEND=postgres requires the 'psycopg' package to be installed."
+            )
+        if not self.dsn:
+            raise RuntimeError(
+                "STATE_BACKEND=postgres requires POSTGRES_DSN or DATABASE_URL."
+            )
+        return psycopg.connect(self.dsn)
+
+    def ensure_schema(self, conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS state_sections (
+                    name TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+
+    def load_state_dict(self) -> dict | None:
+        with self.connect() as conn:
+            self.ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT name, payload FROM state_sections")
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        return {name: json.loads(payload) for name, payload in rows}
+
+    def save_sections(self, sections: dict[str, str], previous_sections: dict[str, str]):
+        changed_sections = {
+            name: payload
+            for name, payload in sections.items()
+            if previous_sections.get(name) != payload
+        }
+        if not changed_sections:
+            return
+
+        with self.connect() as conn:
+            self.ensure_schema(conn)
+            with conn.cursor() as cur:
+                for name, payload in changed_sections.items():
+                    cur.execute(
+                        """
+                        INSERT INTO state_sections(name, payload)
+                        VALUES(%s, %s)
+                        ON CONFLICT(name) DO UPDATE SET payload = EXCLUDED.payload
+                        """,
+                        (name, payload),
+                    )
+            conn.commit()
+
+    def target_description(self) -> str:
+        return "postgres"
+
+    def startup_check(self) -> str:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                value = cur.fetchone()
+        return f"connection=ok result={value[0] if value else 'unknown'}"
+
+
+class JsonStateFallback:
+    def __init__(self, *paths: str):
+        self.paths = paths
+
+    def load_state_dict(self) -> tuple[dict | None, str | None]:
+        for state_path in self.paths:
+            if not os.path.exists(state_path):
+                continue
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    return json.load(f), state_path
+            except Exception as e:
+                print(f"[load_state] 오류: {e} (경로: {state_path})")
+        return None, None
+
+
+def create_state_backend() -> StateBackend:
+    if STATE_BACKEND_NAME == "sqlite":
+        return SQLiteStateBackend(STATE_DB_FILE)
+    if STATE_BACKEND_NAME == "postgres":
+        return PostgresStateBackend(POSTGRES_DSN)
+    raise ValueError(f"Unsupported STATE_BACKEND: {STATE_BACKEND_NAME}")
+
+
+state_backend: StateBackend = create_state_backend()
+legacy_state_fallback = JsonStateFallback(STATE_FILE, STATE_BACKUP_FILE)
+
+def ensure_state_db(conn: sqlite3.Connection):
+    if isinstance(state_backend, SQLiteStateBackend):
+        state_backend.ensure_schema(conn)
+
+def state_backend_target() -> str:
+    return state_backend.target_description()
+
+def log_state_backend_startup():
+    try:
+        target = state_backend_target()
+        if state_backend.label == "postgres":
+            check = state_backend.startup_check()
+            print(
+                f"[state_backend] backend={state_backend.label} target={target} "
+                f"psycopg={'yes' if psycopg else 'no'} {check}"
+            )
+        else:
+            print(f"[state_backend] backend={state_backend.label} target={target} {state_backend.startup_check()}")
+    except Exception as e:
+        print(f"[state_backend] startup check failed: {e}")
+
+def save_state():
+    global last_saved_sections, save_retry_sections, save_retry_not_before, save_error_log_not_before
+    sections = build_state_sections()
+    now_monotonic = time.monotonic()
+    if sections == last_saved_sections and state_backend.has_storage():
+        return
+    if now_monotonic < save_retry_not_before:
+        save_retry_sections = sections
+        return
+    try:
+        state_backend.save_sections(sections, last_saved_sections)
+        last_saved_sections = sections
+        save_retry_sections = None
+        save_retry_not_before = 0.0
+        save_error_log_not_before = 0.0
+    except (OSError, sqlite3.Error) as e:
+        if is_no_space_error(e):
+            save_retry_sections = sections
+            save_retry_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
+            if now_monotonic >= save_error_log_not_before:
+                print(
+                    f"[save_state] 저장 보류: 디스크 공간 부족으로 {SAVE_RETRY_COOLDOWN_SECONDS:.0f}초 뒤 재시도합니다. "
+                    f"(경로: {STATE_DB_FILE}, 섹션 수: {len(sections)})"
+                )
+                print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
+                save_error_log_not_before = now_monotonic + SAVE_RETRY_COOLDOWN_SECONDS
+            return
+        print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
+    except Exception as e:
+        print(f"[save_state] 오류: {e} (경로: {STATE_DB_FILE})")
+
+def load_state_legacy_direct():
+    global default_season, last_saved_sections
     state = None
     loaded_path = None
-    for state_path in (STATE_FILE, STATE_BACKUP_FILE):
-        if not os.path.exists(state_path):
-            continue
+
+    if os.path.exists(STATE_DB_FILE):
         try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            loaded_path = state_path
-            break
+            with sqlite3.connect(STATE_DB_FILE) as conn:
+                ensure_state_db(conn)
+                rows = conn.execute("SELECT name, payload FROM state_sections").fetchall()
+            if rows:
+                state = {}
+                for name, payload in rows:
+                    state[name] = json.loads(payload)
+                loaded_path = STATE_DB_FILE
         except Exception as e:
-            print(f"[load_state] 오류: {e} (경로: {state_path})")
+            print(f"[load_state] 오류: {e} (경로: {STATE_DB_FILE})")
+
+    if state is None:
+        for state_path in (STATE_FILE, STATE_BACKUP_FILE):
+            if not os.path.exists(state_path):
+                continue
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                loaded_path = state_path
+                break
+            except Exception as e:
+                print(f"[load_state] 오류: {e} (경로: {state_path})")
 
     if not isinstance(state, dict):
         return
@@ -283,11 +551,65 @@ def load_state():
         brew_data.update(decode_timer_dict(state.get("brew_data")))
         trade_data.clear()
         trade_data.update(decode_timer_dict(state.get("trade_data")))
+        last_saved_sections = build_state_sections()
+        print(f"[load_state] loaded from {loaded_path}")
+    except Exception as e:
+        print(f"[load_state] 상태 적용 오류: {e} (경로: {loaded_path})")
+
+def load_state():
+    global default_season, last_saved_sections
+    state = None
+    loaded_path = None
+
+    try:
+        state = state_backend.load_state_dict()
+        if state is not None:
+            loaded_path = state_backend_target()
+    except Exception as e:
+        print(f"[load_state] 오류: {e} (backend={state_backend.label}, path={state_backend_target()})")
+
+    if state is None:
+        state, loaded_path = legacy_state_fallback.load_state_dict()
+
+    if not isinstance(state, dict):
+        return
+
+    try:
+        loaded_default = (
+            state.get("default_season")
+            or state.get("season")
+            or state.get("current_season", {}).get("default")
+        )
+        if loaded_default in SEASON_ORDER:
+            default_season = loaded_default
+
+        loaded_current_season = {
+            int(gid): season
+            for gid, season in state.get("current_season", {}).items()
+            if str(gid).isdigit() and season in SEASON_ORDER
+        }
+
+        current_season.clear()
+        current_season.update(loaded_current_season)
+        plant_data.clear()
+        plant_data.update(decode_timer_dict(state.get("plant_data"), nested_slots=True))
+        water_data.clear()
+        water_data.update(decode_timer_dict(state.get("water_data")))
+        pickle_data.clear()
+        pickle_data.update(decode_timer_dict(state.get("pickle_data")))
+        brew_data.clear()
+        brew_data.update(decode_timer_dict(state.get("brew_data")))
+        trade_data.clear()
+        trade_data.update(decode_timer_dict(state.get("trade_data")))
+        last_saved_sections = build_state_sections()
         print(f"[load_state] loaded from {loaded_path}")
     except Exception as e:
         print(f"[load_state] 상태 적용 오류: {e} (경로: {loaded_path})")
 
 async def safe_interaction_error(interaction: discord.Interaction, embed: discord.Embed):
+    if interaction.is_expired():
+        print("[interaction] expired before error response could be sent")
+        return
     try:
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -295,6 +617,8 @@ async def safe_interaction_error(interaction: discord.Interaction, embed: discor
             await interaction.response.send_message(embed=embed, ephemeral=True)
     except discord.NotFound:
         print("[interaction] expired before error response could be sent")
+    except discord.InteractionResponded:
+        print("[interaction] error response skipped because interaction was already acknowledged")
     except discord.HTTPException as e:
         if getattr(e, "status", None) == 429:
             retry_after = get_retry_after(e)
@@ -592,6 +916,10 @@ async def restore_running_tasks():
         if channel is None:
             water_data.pop(user_id, None)
             continue
+        if data.get("awaiting_click"):
+            print(f"[restore] dropping pending water prompt for user={user_id} after restart")
+            water_data.pop(user_id, None)
+            continue
         water_tasks[user_id] = bot.loop.create_task(water_loop(user_id, channel, mention))
         restored += 1
 
@@ -629,6 +957,7 @@ async def restore_running_tasks():
 async def on_ready():
     global season_task, state_loaded, commands_synced
     if not state_loaded:
+        log_state_backend_startup()
         load_state()
         state_loaded = True
         await restore_running_tasks()
@@ -1084,6 +1413,8 @@ async def cmd_water(interaction: discord.Interaction):
         "season": season,
         "water_min": water_min,
         "water_count": 0,
+        "warn_sent": False,
+        "awaiting_click": False,
         "next_water": now,
         "start": now,
         "timer_version": 0,
@@ -1099,11 +1430,11 @@ async def cmd_water(interaction: discord.Interaction):
     embed.add_field(name="🌱 작물 성장", value="✅ 클릭 후 다음 물주기 시간까지 작물이 성장합니다. 다음 물주기를 놓치면 성장이 멈춥니다.", inline=False)
     embed.set_footer(text="지금 바로 ✅ 반응 클릭해서 첫 물주기!")
 
-    await interaction.followup.send(embed=embed)
     save_state()
     water_tasks[user_id] = bot.loop.create_task(
         water_loop(user_id, interaction.channel, interaction.user.mention)
     )
+    await interaction.followup.send(embed=embed)
 
 
 # ─────────────────────────────────────────
@@ -1121,8 +1452,25 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             season        = data["season"]
             version       = data.get("timer_version", 0)
             next_water    = data.get("next_water", datetime.now(KST))
+            warn_sent     = data.get("warn_sent", False)
 
-            if current_count > 0 and next_water > datetime.now(KST):
+            if current_count > 0 and next_water > datetime.now(KST) and warn_sent:
+                wait_sec = max((next_water - datetime.now(KST)).total_seconds(), 0)
+                slept = 0.0
+                while slept < wait_sec:
+                    await asyncio.sleep(min(5.0, wait_sec - slept))
+                    slept += 5.0
+                    if user_id not in water_data:
+                        break
+                    if water_data[user_id].get("timer_version", 0) != version:
+                        break
+
+                if user_id not in water_data:
+                    break
+                if water_data[user_id].get("timer_version", 0) != version:
+                    continue
+
+            if current_count > 0 and next_water > datetime.now(KST) and not warn_sent:
                 wait_sec = max((next_water - datetime.now(KST)).total_seconds() - 60, 0)
                 slept = 0.0
                 while slept < wait_sec:
@@ -1147,6 +1495,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                     ),
                     color=0xFEE75C
                 ))
+                data["warn_sent"] = True
+                save_state()
 
                 wait_sec = max((data["next_water"] - datetime.now(KST)).total_seconds(), 0)
                 slept = 0.0
@@ -1176,6 +1526,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             water_embed.add_field(name="물주기 간격", value=f"⏱ `{water_min}분`마다",       inline=True)
             water_embed.add_field(name="현재 계절",   value=f"{season_emoji(season)} {season}", inline=True)
 
+            data["awaiting_click"] = True
+            save_state()
             water_msg = await safe_channel_send(channel, embed=water_embed)
             await water_msg.add_reaction("✅")
 
@@ -1194,6 +1546,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
                 )
             except asyncio.TimeoutError:
                 if user_id in water_data:
+                    water_data[user_id]["awaiting_click"] = True
+                    save_state()
                     await safe_channel_send(channel, embed=discord.Embed(
                         title="⚠️ 물주기 미완료",
                         description=(
@@ -1217,6 +1571,8 @@ async def water_loop(user_id: int, channel: discord.TextChannel, mention: str):
             click_time       = datetime.now(KST)
             next_water_time  = click_time + timedelta(minutes=water_min)
             data["next_water"] = next_water_time
+            data["warn_sent"] = False
+            data["awaiting_click"] = False
 
             # ── 심기 슬롯 성장 시작/연장 반영 ──────────────────────
             # 다음 물주기 시간까지 작물 성장을 진행시킨다.
@@ -1856,13 +2212,27 @@ async def cmd_cancel_trade(interaction: discord.Interaction):
 # ─────────────────────────────────────────
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    command_name = getattr(getattr(interaction, "command", None), "name", "unknown")
+    user_id = getattr(getattr(interaction, "user", None), "id", "unknown")
+    guild_id = getattr(interaction, "guild_id", "unknown")
+    channel_id = getattr(interaction, "channel_id", "unknown")
+
+    print(
+        f"[app_command_error] command=/{command_name} user={user_id} guild={guild_id} "
+        f"channel={channel_id} error={error.__class__.__name__}: {error}"
+    )
+
     if isinstance(error, app_commands.MissingPermissions):
         desc, color = "이 명령어는 **서버 관리자**만 사용할 수 있습니다.", 0xED4245
     elif isinstance(error, app_commands.CommandOnCooldown):
         desc, color = f"`{round(error.retry_after, 1)}초` 후 다시 시도하세요.", 0xFEE75C
     elif isinstance(error, app_commands.CommandInvokeError):
+        print("[app_command_error] original traceback follows:")
+        traceback.print_exception(type(error.original), error.original, error.original.__traceback__)
         desc, color = f"명령어 실행 중 오류\n```{str(error.original)}```", 0xED4245
     else:
+        print("[app_command_error] traceback follows:")
+        traceback.print_exception(type(error), error, error.__traceback__)
         desc, color = f"예기치 않은 오류\n```{str(error)}```", 0xED4245
 
     embed = discord.Embed(title="⚠️ 오류", description=desc, color=color)
