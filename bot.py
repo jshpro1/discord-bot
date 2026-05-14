@@ -171,6 +171,8 @@ pickle_data: dict[int, dict]         = {}
 pickle_tasks: dict[int, asyncio.Task] = {}
 brew_data:   dict[int, dict]         = {}
 brew_tasks:   dict[int, asyncio.Task] = {}
+repeat_alarm_data: dict[int, dict] = {}
+repeat_alarm_tasks: dict[int, asyncio.Task] = {}
 
 
 # ─────────────────────────────────────────
@@ -749,6 +751,12 @@ def cancel_brew(user_id: int):
     brew_data.pop(user_id, None)
     save_state()
 
+def cancel_repeat_alarm(user_id: int):
+    task = repeat_alarm_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+    repeat_alarm_data.pop(user_id, None)
+
 def cancel_task_map(task_map: dict):
     for task in list(task_map.values()):
         if isinstance(task, dict):
@@ -764,6 +772,7 @@ def reset_non_season_state() -> dict[str, int]:
         "pickle": len(pickle_data),
         "brew": len(brew_data),
         "trade": len(trade_data),
+        "repeat_alarm": len(repeat_alarm_data),
     }
 
     cancel_task_map(plant_tasks)
@@ -771,12 +780,14 @@ def reset_non_season_state() -> dict[str, int]:
     cancel_task_map(pickle_tasks)
     cancel_task_map(brew_tasks)
     cancel_task_map(trade_tasks)
+    cancel_task_map(repeat_alarm_tasks)
 
     plant_data.clear()
     water_data.clear()
     pickle_data.clear()
     brew_data.clear()
     trade_data.clear()
+    repeat_alarm_data.clear()
 
     save_state()
     return counts
@@ -1184,6 +1195,7 @@ async def cmd_reset_data(ctx: commands.Context, 확인: str = ""):
     embed.add_field(name="🫙 절임통", value=f"`{counts['pickle']}`개", inline=True)
     embed.add_field(name="🍺 양조통", value=f"`{counts['brew']}`개", inline=True)
     embed.add_field(name="🚢 무역", value=f"`{counts['trade']}`개", inline=True)
+    embed.add_field(name="⏰ 반복알람", value=f"`{counts['repeat_alarm']}`개", inline=True)
     embed.add_field(name="보존됨", value=f"기본 계절 `{default_season}`, 서버별 계절 `{len(current_season)}`개", inline=False)
     await ctx.send(embed=embed)
 
@@ -1211,6 +1223,9 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="🚢 /무역종료 [시간]",     value="지정한 시간 뒤 무역 완료 알림 (예: `7시35분` / `30분` / `2시`)", inline=False)
     embed.add_field(name="🏳️ /무역포기",           value="무역 포기 + 3시간 뒤 재확인 알림",                         inline=False)
     embed.add_field(name="⛔ /무역타이머취소",      value="진행 중인 무역 타이머 취소",                               inline=False)
+    embed.add_field(name="─────────────────", value="⏰ **반복 알림**", inline=False)
+    embed.add_field(name="⏰ /반복알람 [초]",       value="입력한 초마다 알람 전송 (최소 3초, 재시작 시 초기화)",      inline=False)
+    embed.add_field(name="⛔ /반복알람취소",        value="진행 중인 반복 알람 중지",                                  inline=False)
     embed.set_footer(text="서버 1일 = 현실 48분 | 자정(KST) 기준 계절 자동 변경\n🌱 물을 준 동안만 작물이 성장하고, 다음 물주기를 놓치면 성장이 멈춥니다")
     await interaction.response.send_message(embed=embed)
 
@@ -2010,6 +2025,42 @@ async def process_timer_loop(kind: str, user_id: int, channel: discord.TextChann
             data_map.pop(user_id, None)
             save_state()
 
+async def repeat_alarm_loop(user_id: int, channel: discord.TextChannel):
+    try:
+        while True:
+            data = repeat_alarm_data.get(user_id)
+            if not data:
+                return
+
+            interval_seconds = data.get("interval_seconds")
+            if not isinstance(interval_seconds, int) or interval_seconds <= 0:
+                repeat_alarm_data.pop(user_id, None)
+                return
+
+            await asyncio.sleep(interval_seconds)
+
+            if user_id not in repeat_alarm_data:
+                return
+
+            mention = repeat_alarm_data[user_id].get("user_mention") or f"<@{user_id}>"
+            now = datetime.now(KST)
+            await safe_channel_send(
+                channel,
+                content=mention,
+                embed=discord.Embed(
+                    title="⏰ 반복 알람",
+                    description=f"{mention} `{interval_seconds}초` 반복 알람입니다.\n🕒 `{fmt_time(now)}`",
+                    color=0x5865F2
+                )
+            )
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[repeat_alarm_loop] error (user={user_id}): {e}")
+    finally:
+        repeat_alarm_tasks.pop(user_id, None)
+        repeat_alarm_data.pop(user_id, None)
+
 @bot.tree.command(name="절임통", description="절임통 타이머를 시작합니다 (인게임 3일 = 144분)")
 async def cmd_pickle(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -2282,6 +2333,61 @@ async def cmd_cancel_trade(interaction: discord.Interaction):
 # ─────────────────────────────────────────
 # 에러 핸들러
 # ─────────────────────────────────────────
+@bot.tree.command(name="반복알람", description="입력한 초마다 반복 알람을 보냅니다 (재시작 시 초기화)")
+@app_commands.describe(초="반복할 초 간격 (최소 3초)")
+async def cmd_repeat_alarm(interaction: discord.Interaction, 초: app_commands.Range[int, 3, 3600]):
+    user_id = interaction.user.id
+
+    if user_id in repeat_alarm_tasks and not repeat_alarm_tasks[user_id].done():
+        await interaction.response.send_message(embed=discord.Embed(
+            title="⚠️ 이미 반복 알람 진행 중",
+            description="`/반복알람취소`로 먼저 중지한 뒤 다시 시작해 주세요.",
+            color=0xFEE75C
+        ), ephemeral=True)
+        return
+
+    mention = interaction.user.mention
+    now = datetime.now(KST)
+    repeat_alarm_data[user_id] = {
+        "interval_seconds": int(초),
+        "user_mention": mention,
+    }
+    repeat_alarm_tasks[user_id] = bot.loop.create_task(repeat_alarm_loop(user_id, interaction.channel))
+
+    embed = discord.Embed(
+        title="⏰ 반복 알람 시작",
+        description=(
+            f"{mention} 이제부터 `{초}초`마다 알람을 보냅니다.\n"
+            f"중지하려면 `/반복알람취소`를 사용해 주세요.\n"
+            f"이 알람은 메모리 전용이라 봇 재시작 시 사라집니다."
+        ),
+        color=0x5865F2
+    )
+    embed.add_field(name="시작 시각", value=f"🕒 `{fmt_time(now)}`", inline=True)
+    embed.add_field(name="반복 간격", value=f"⏱️ `{초}초`", inline=True)
+    await interaction.response.send_message(content=mention, embed=embed)
+
+@bot.tree.command(name="반복알람취소", description="진행 중인 반복 알람을 중지합니다")
+async def cmd_cancel_repeat_alarm(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    data = repeat_alarm_data.get(user_id)
+
+    if user_id not in repeat_alarm_tasks or repeat_alarm_tasks[user_id].done() or not data:
+        await interaction.response.send_message(embed=discord.Embed(
+            title="❌ 진행 중인 반복 알람 없음",
+            description="현재 반복 알람이 실행 중이 아닙니다.",
+            color=0xED4245
+        ), ephemeral=True)
+        return
+
+    interval_seconds = data.get("interval_seconds", "?")
+    cancel_repeat_alarm(user_id)
+    await interaction.response.send_message(embed=discord.Embed(
+        title="🛑 반복 알람 중지",
+        description=f"`{interval_seconds}초` 반복 알람이 중지되었습니다.",
+        color=0xED4245
+    ))
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     command_name = getattr(getattr(interaction, "command", None), "name", "unknown")
